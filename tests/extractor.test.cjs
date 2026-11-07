@@ -1219,6 +1219,82 @@ test('source-unavailable image placeholders preserve explanations, metadata and 
   assert.equal(await placeholder.isVisible(), true);
 }));
 
+test('a failed local image retries only its same-origin file and restores geometry, description and surrounding text', () => withPage(async page => {
+  const fixture = await decodedImageFixture(page);
+  const html = await page.evaluate(() => {
+    __test.data[0].DetailHtml = '<p>Before the synthetic image.</p><img src="images/img_1.png" width="120" alt="Exact &amp; description" title="Original image title" data-original="https://campus.invalid/original.png"><p>After the synthetic image.</p>';
+    return __test.generateOfflineHtml(true);
+  });
+  const requests = [];
+  page.on('request', request => requests.push(request.url()));
+  let attempts = 0;
+  await page.route('**/images/img_1.png*', route => ++attempts === 1
+    ? route.fulfill({status:503,body:'Synthetic temporary failure'})
+    : route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')}));
+  await page.setContent(html, {waitUntil:'domcontentloaded'});
+  await page.waitForFunction(() => document.querySelector('.image-retry'));
+  assert.equal(await page.locator('.img-failed').count(),1);
+  assert.equal(await page.locator('.img-failed a').getAttribute('href'),'https://campus.invalid/original.png');
+  await page.locator('.image-retry').click();
+  await page.waitForFunction(() => document.querySelector('.detail-box img')?.naturalWidth===400);
+  const restored = await page.locator('.detail-box img').evaluate(image => {
+    const rect=image.getBoundingClientRect();
+    return {alt:image.alt,title:image.title,width:rect.width,height:rect.height,naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,original:image.getAttribute('data-original')};
+  });
+  assert.deepEqual(restored,{alt:'Exact & description',title:'Original image title',width:120,height:60,naturalWidth:400,naturalHeight:200,original:'https://campus.invalid/original.png'});
+  assert.equal(await page.locator('.img-failed').count(),0);
+  assert.deepEqual(await page.locator('.detail-box p').allTextContents(),['Before the synthetic image.','After the synthetic image.']);
+  assert.equal(requests.length,2);
+  const first=new URL(requests[0]),retry=new URL(requests[1]);
+  assert.equal(first.origin,'http://fixture.test'); assert.equal(retry.origin,first.origin);
+  assert.equal(retry.pathname,first.pathname); assert.equal(retry.searchParams.has('bistu-retry'),true);
+  assert.ok(requests.every(url=>new URL(url).hostname==='fixture.test'));
+}));
+
+test('repeated local image failures keep one retry placeholder while source-missing images remain manual links', () => withPage(async page => {
+  await decodedImageFixture(page);
+  const html = await page.evaluate(() => {
+    const original='https://campus.invalid/';
+    const kept=__test.images.get('http://fixture.test/first.png');
+    __test.setImages([[original+'local-original.png',kept],...[404,404,410].map((status,index)=>[original+'missing-'+index+'.png',{
+      filename:'img_'+(20+index)+'.png',sourceUnavailable:true,status,buffer:null,downloaded:false,alt:'Original missing diagram '+index
+    }])]);
+    __test.data[0].DetailHtml='<p>Persistent failure fixture</p><img src="images/img_1.png" data-original="'+original+'local-original.png">'+
+      [0,1,2].map(index=>'<img src="images/img_'+(20+index)+'.png" alt="Original missing diagram '+index+'">').join('');
+    return __test.generateOfflineHtml(true);
+  });
+  const requests=[]; page.on('request',request=>requests.push(request.url()));
+  await page.route('**/images/img_1.png*',route=>route.fulfill({status:404,body:'Synthetic persistent failure'}));
+  await page.setContent(html,{waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>document.querySelector('.image-retry'));
+  for(let retry=0;retry<3;retry++) {
+    assert.equal(await page.locator('.img-failed:not(.source-image-unavailable)').count(),1);
+    assert.equal(await page.locator('.source-image-unavailable').count(),3);
+    assert.equal(await page.locator('.source-image-unavailable .image-retry').count(),0);
+    assert.equal(await page.locator('.image-retry').count(),1);
+    assert.equal(requests.length,retry+1);
+    await page.locator('.image-retry').click();
+    await page.waitForFunction(()=>document.querySelectorAll('.image-retry').length===1 && !document.querySelector('.detail-box img'));
+  }
+  assert.equal(requests.length,4);
+  assert.equal(await page.locator('.img-failed').count(),4);
+  assert.match(await page.locator('.detail-box').textContent(),/Persistent failure fixture/);
+  assert.equal(await page.locator('.source-image-unavailable a').count(),3);
+  assert.ok(requests.every(url=>new URL(url).origin==='http://fixture.test'&&new URL(url).pathname.endsWith('/images/img_1.png')));
+  // Exercise the reader's own guard independently of the export sanitizer/CSP.
+  // These synthetic inputs must never acquire a one-click automatic retry path.
+  for(const unsafe of ['https://foreign.invalid/image.png','javascript:void(0)','file:///synthetic-fixture.invalid/image.png','data:text/html;base64,AAAA','http://[']) {
+    const altered=html.replace('src="images/img_1.png"','src="'+unsafe+'"');
+    assert.notEqual(altered,html);
+    await page.setContent(altered,{waitUntil:'domcontentloaded'});
+    await page.waitForFunction(()=>document.querySelectorAll('.img-failed:not(.source-image-unavailable)').length===1);
+    assert.equal(await page.locator('.image-retry').count(),0,unsafe);
+  }
+  await page.setContent(html.replace('src="images/img_1.png"','src="data:image/png;base64,AAAA"'),{waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>document.querySelector('.image-retry'));
+  assert.equal(await page.locator('.image-retry').count(),1,'a passive image data URL remains a local retry source');
+}));
+
 test('AI skips unavailable question images while other answers and stage 4 complete honestly', () => withPage(async page => {
   const result = await page.evaluate(async () => {
     __test.state.stage = 3;
@@ -1568,22 +1644,36 @@ async function decodedImageFixture(page, offscreen = false) {
   }, offscreen);
 }
 
-test('images decode asynchronously while only validated bytes supply natural geometry without replacing display width', () => withPage(async page => {
+async function printImageQueueFixture(page, count) {
+  const fixture = await decodedImageFixture(page);
+  const html = await page.evaluate(size => {
+    const buffer = [...__test.images.values()][0].buffer;
+    __test.setImages(Array.from({length:size}, (_,index) => ['http://fixture.test/print-' + index + '.png', { filename:'img_' + (index+1) + '.png', buffer, downloaded:true }]));
+    __test.setData([{GlobalUID:0,QuestionType:'Blank',DetailHtml:'<p>Synthetic print queue fixture</p>' +
+      Array.from({length:size},(_,index)=>'<img src="images/img_' + (index+1) + '.png" alt="Synthetic queue image">').join('')}]);
+    return __test.generateOfflineHtml(true);
+  }, count);
+  return {...fixture,html};
+}
+
+test('only validated image geometry permits deferred loading without replacing explicit display width', () => withPage(async page => {
   const result = await decodedImageFixture(page);
   assert.equal(result.before, null);
   assert.deepEqual(result.geometry, { width: 400, height: 200 });
   assert.equal(result.unvalidatedGeometry, null);
   assert.equal(result.images.length, 4);
   for (const image of result.images) {
-    assert.equal(image.loading, 'eager'); assert.equal(image.decoding, 'async');
+    assert.equal(image.decoding, 'async');
   }
   for (const image of result.images.slice(0, 3)) {
+    assert.equal(image.loading, 'lazy');
     assert.equal(image.aspectRatio, '400 / 200');
   }
   assert.equal(result.images[0].width, '150'); assert.equal(result.images[0].styleWidth, '120px');
   assert.equal(result.images[1].width, '400'); assert.equal(result.images[1].height, '200');
   assert.equal(result.images[2].width, '90');
   assert.equal(result.images[3].aspectRatio, '');
+  assert.equal(result.images[3].loading, 'eager');
   assert.equal(result.images[3].width, null); assert.equal(result.images[3].height, null);
 }));
 
@@ -1665,6 +1755,44 @@ test('native print transitions retain delayed offscreen images until their local
   });
 });
 
+test('printing prepares a full image queue with at most two simultaneous decodes and retains failed-image notices', () => withPage(async page => {
+  const fixture = await printImageQueueFixture(page, 16);
+  await page.route('**/images/*.png', route => route.request().url().endsWith('img_16.png')
+    ? route.fulfill({status:404,body:'Synthetic missing image'})
+    : route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')}));
+  await page.setContent(fixture.html, {waitUntil:'domcontentloaded'});
+  await page.waitForFunction(() => document.querySelectorAll('.img-failed').length===1 && [...document.querySelectorAll('.detail-box img')].every(image=>image.complete&&image.naturalWidth===400));
+  await page.evaluate(() => {
+    window.__decodeStats = {active:0,peak:0,started:0,completed:0};
+    window.__decodeReleases = []; window.__queuedPrints = [];
+    for (const image of document.querySelectorAll('.detail-box img')) image.decode = () => {
+      __decodeStats.started++; __decodeStats.active++; __decodeStats.peak=Math.max(__decodeStats.peak,__decodeStats.active);
+      return new Promise(resolve => __decodeReleases.push(() => { __decodeStats.active--; __decodeStats.completed++; resolve(); }));
+    };
+    window.print = () => __queuedPrints.push({completed:__decodeStats.completed,active:__decodeStats.active,
+      images:document.querySelectorAll('.detail-box img').length,missing:document.querySelectorAll('.img-failed').length});
+  });
+  await page.locator('#printBtn').click();
+  await page.waitForFunction(() => __decodeStats.started>=2);
+  assert.deepEqual(await page.evaluate(() => __decodeStats),{active:2,peak:2,started:2,completed:0});
+  assert.equal(await page.evaluate(() => __queuedPrints.length),0);
+  await page.keyboard.press('Control+p');
+  assert.equal(await page.evaluate(() => __decodeStats.started),2);
+  for (let completed=0;completed<15;) {
+    const released = await page.evaluate(() => { const ready=__decodeReleases.splice(0); ready.forEach(resolve=>resolve()); return ready.length; });
+    assert.ok(released>0 && released<=2);
+    completed+=released;
+    if(completed<15) {
+      await page.waitForFunction(() => __decodeReleases.length>0);
+      assert.equal(await page.evaluate(() => __queuedPrints.length),0);
+    }
+  }
+  await page.waitForFunction(() => __queuedPrints.length===1 && !document.querySelector('#printBtn').disabled);
+  assert.deepEqual(await page.evaluate(() => __decodeStats),{active:0,peak:2,started:15,completed:15});
+  assert.deepEqual(await page.evaluate(() => __queuedPrints),[{completed:15,active:0,images:15,missing:1}]);
+  assert.match(await page.locator('.img-failed').textContent(),/缺失|无法解码/);
+}));
+
 test('print preparation times out stalled loads or decodes, cleans listeners and can retry successfully', async () => {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const timeoutDeclaration = 'const PRINT_PREPARE_TIMEOUT_MS = 30000;';
@@ -1675,7 +1803,7 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
     const harness = await createHarness(browser, instrumented), page = harness.page;
     let release; const gate = new Promise(resolve => { release = resolve; });
     try {
-      const fixture = await decodedImageFixture(page, true);
+      const fixture = await printImageQueueFixture(page, 12);
       await page.route('**/images/*.png', async route => {
         if (mode === 'load') await gate;
         await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') });
@@ -1718,6 +1846,7 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
         assert.equal(await page.locator('#printBtn').textContent(), '打印 / 保存 PDF');
         assert.deepEqual(await page.evaluate(() => ({ prints:__printCalls, listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
           { prints:0, listeners:0, timers:0, unhandled:0 }, mode);
+        if(mode==='decode') assert.equal(await page.evaluate(() => __releaseDecodes.length),2,'a retry must reuse unfinished native decodes instead of starting more');
       }
       release();
       await page.evaluate(() => __restoreImageDecodes());
@@ -2461,4 +2590,234 @@ test('subjective questions inspect official details before AI and unresolved off
   assert.notEqual(result.afterAI[2].IsAIAnswer, true);
   assert.equal(result.afterAI[3].AnswerSource, 'platform-reference');
   assert.equal(result.afterAI[4].AnswerSource, 'platform-answer');
+}));
+
+async function settleReader(page) {
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+    for (let index=0;index<6;index++) await new Promise(requestAnimationFrame);
+  });
+}
+
+async function assertReaderGeometry(page, label) {
+  await settleReader(page);
+  const result=await page.evaluate(() => {
+    const last=[...document.querySelectorAll('.topic')].filter(card=>!card.classList.contains('hidden')).at(-1);
+    const measure=()=>({height:document.documentElement.scrollHeight,lastTop:last ? last.getBoundingClientRect().top+scrollY : 0,lastHeight:last ? last.getBoundingClientRect().height : 0});
+    const cached=measure(), override=document.createElement('style');
+    override.textContent='.topic:not(.hidden){content-visibility:visible!important;contain-intrinsic-block-size:none!important}';
+    document.head.append(override);
+    const actual=measure(); override.remove();
+    return {cached,actual};
+  });
+  for (const key of ['height','lastTop','lastHeight']) assert.ok(Math.abs(result.cached[key]-result.actual[key])<=2,label+': '+JSON.stringify(result));
+  return result.cached;
+}
+
+function geometryRows(count=60) {
+  return Array.from({length:count},(_,GlobalUID)=>({GlobalUID,QuestionType:'Program',ChapterName:GlobalUID%2?'Group B':'Group A',DegreeLevel:'一般',
+    DetailHtml:'<p>'+(GlobalUID===count-1?'SyntheticGeometryLastToken':'Synthetic geometry prompt '+GlobalUID)+'</p>',
+    SniffedAnswer:Array.from({length:35},(_,line)=>'// Synthetic line '+line+' '+('readable content '.repeat(8))).join('\n'),AnswerSource:'platform-reference'}));
+}
+
+test('reader geometry stays exact through answers, filters, viewport changes and print transitions',()=>withPage(async page=>{
+  await page.setViewportSize({width:1400,height:900});
+  await renderStudyFixture(page,geometryRows());
+  const full=await assertReaderGeometry(page,'initial');
+  await page.locator('#toggleAnsBtn').click();
+  const hidden=await assertReaderGeometry(page,'all answers hidden');
+  assert.ok(full.height-hidden.height>1000);
+  await page.locator('#toggleAnsBtn').click();
+  const restored=await assertReaderGeometry(page,'all answers restored');
+  assert.ok(Math.abs(restored.height-full.height)<=2);
+  await page.locator('.answer-toggle').first().click();
+  await assertReaderGeometry(page,'one answer hidden');
+  await page.locator('#chapterFilter').selectOption('Group B');
+  await assertReaderGeometry(page,'filtered half');
+  assert.equal(await page.locator('.topic:not(.hidden)').count(),30);
+  assert.equal(await page.locator('.topic.hidden').evaluateAll(cards=>cards.every(card=>card.getBoundingClientRect().height===0&&card.getAttribute('aria-hidden')==='true')),true);
+  await page.locator('#resetFilters').click();
+  await assertReaderGeometry(page,'filter restored');
+  for(const viewport of [{width:1400,height:520},{width:980,height:700},{width:390,height:844}]) {
+    await page.setViewportSize(viewport); await assertReaderGeometry(page,'viewport '+JSON.stringify(viewport));
+  }
+  await page.evaluate(()=>window.dispatchEvent(new Event('beforeprint')));
+  await page.emulateMedia({media:'print'});
+  await assertReaderGeometry(page,'print');
+  assert.equal(await page.locator('.topic').evaluateAll(cards=>cards.every(card=>getComputedStyle(card).contentVisibility==='visible')),true);
+  await page.emulateMedia({media:'screen'});
+  await page.evaluate(()=>window.dispatchEvent(new Event('afterprint')));
+  await assertReaderGeometry(page,'after print');
+  const found=await page.evaluate(()=>{scrollTo(0,0);getSelection().removeAllRanges();return window.find('SyntheticGeometryLastToken',false,false,true);});
+  assert.equal(found,true);
+  await page.locator('.topic').last().scrollIntoViewIfNeeded();
+  assert.match(await page.locator('.topic').last().textContent(),/SyntheticGeometryLastToken/);
+}));
+
+test('late unknown image loads and failed-image retries update distant question positions',()=>withPage(async page=>{
+  const fixture=await decodedImageFixture(page),rows=geometryRows();
+  rows[20].DetailHtml+='<img src="images/img_101.png" alt="Late synthetic diagram">';
+  rows[30].DetailHtml+='<img src="images/img_102.png" alt="Retry synthetic diagram">';
+  const html=await page.evaluate(data=>{__test.setData(data);return __test.generateOfflineHtml(true);},rows);
+  let releaseLate;const gate=new Promise(resolve=>{releaseLate=resolve;});let attempts=0;
+  await page.route('**/images/img_101.png',async route=>{await gate;await route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')});});
+  await page.route('**/images/img_102.png*',route=>++attempts===1?route.fulfill({status:404,body:'Synthetic temporary failure'}):route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')}));
+  try {
+    await page.setContent(html,{waitUntil:'domcontentloaded'});
+    await page.waitForFunction(()=>document.querySelectorAll('.image-retry').length===1);
+    const before=await assertReaderGeometry(page,'image pending and failed');
+    releaseLate();
+    await page.waitForFunction(()=>document.querySelector('img[alt="Late synthetic diagram"]').naturalWidth===400);
+    const loaded=await assertReaderGeometry(page,'late image loaded');
+    assert.ok(loaded.height>before.height+100);
+    await page.locator('.image-retry').click();
+    await page.waitForFunction(()=>document.querySelector('img[alt="Retry synthetic diagram"]')?.naturalWidth===400);
+    await assertReaderGeometry(page,'image retry restored');
+    assert.equal(attempts,2);assert.equal(await page.locator('.img-failed').count(),0);
+  } finally {releaseLate();}
+}));
+
+test('Safari and iOS Chrome readers retain ordinary visible layout and last-question access',async()=>{
+  const agents=[
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/130.0.0.0 Mobile/15E148 Safari/604.1'
+  ];
+  for(const userAgent of agents) {
+    const h=await createHarness(browser,undefined,undefined,{userAgent});
+    try {
+      await renderStudyFixture(h.page,geometryRows(20));await settleReader(h.page);
+      assert.equal(await h.page.locator('.topic').evaluateAll(cards=>cards.every(card=>getComputedStyle(card).contentVisibility==='visible')),true);
+      await assertReaderGeometry(h.page,'ordinary reader layout');
+      await h.page.locator('.topic').last().scrollIntoViewIfNeeded();
+      assert.match(await h.page.locator('.topic').last().textContent(),/SyntheticGeometryLastToken/);
+    } finally {await h.close();}
+  }
+});
+
+test('HTTP background prefetch and touch printing bound cold offscreen image requests',async()=>{
+  for(const touch of [false,true]) {
+    const h=await createHarness(browser,undefined,undefined,touch?{viewport:{width:390,height:844},hasTouch:true,isMobile:true}:{viewport:{width:1400,height:900}});
+    let unblockAll=false;const held=[];let active=0,peak=0,requested=0;
+    try {
+      const fixture=await printImageQueueFixture(h.page,12);
+      const html=await h.page.evaluate(()=>{
+        __test.data[0].DetailHtml='<div style="height:30000px">Synthetic far-offscreen images</div>'+__test.data[0].DetailHtml;
+        return __test.generateOfflineHtml(true);
+      });
+      await h.page.route('**/images/*.png',async route=>{
+        requested++;active++;peak=Math.max(peak,active);
+        if(!unblockAll) await new Promise(resolve=>held.push(resolve));
+        active--;await route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')});
+      });
+      await h.page.setContent(html,{waitUntil:'domcontentloaded'});await settleReader(h.page);await h.page.waitForTimeout(100);
+      assert.equal(await h.page.evaluate(()=>matchMedia('(pointer:coarse)').matches),touch);
+      if(touch) assert.equal(requested,0,'far touch images must remain deferred');
+      else assert.equal(requested,2,'desktop warming may fetch only two extra far images');
+      await h.page.evaluate(()=>{window.__policyPrints=[];window.print=()=>__policyPrints.push([...document.querySelectorAll('.detail-box img')].every(img=>img.complete&&img.naturalWidth===400));});
+      if(touch) await h.page.locator('#printBtn').click();
+      for(let completed=0;completed<12;) {
+        for(let retry=0;held.length===0&&retry<100;retry++) await h.page.waitForTimeout(10);
+        assert.ok(held.length>0&&held.length<=2,'bounded pending image batch');
+        const ready=held.splice(0);completed+=ready.length;ready.forEach(resolve=>resolve());
+        if(completed<12) assert.equal(await h.page.evaluate(()=>__policyPrints.length),0);
+      }
+      await h.page.waitForFunction(()=>[...document.querySelectorAll('.detail-box img')].every(img=>img.complete&&img.naturalWidth===400));
+      assert.equal(requested,12);assert.ok(peak<=2,'peak image requests: '+peak);
+      if(touch) {await h.page.waitForFunction(()=>__policyPrints.length===1);assert.deepEqual(await h.page.evaluate(()=>__policyPrints),[true]);}
+    } finally {unblockAll=true;held.splice(0).forEach(resolve=>resolve());await h.close();}
+  }
+});
+
+async function assertHorizontalContentReachable(page, marker) {
+  const target=page.getByText(marker,{exact:true});
+  const detail=target.locator('xpath=ancestor::div[contains(concat(" ",normalize-space(@class)," ")," detail-box ")]');
+  const result=await detail.evaluate(element=>{
+    element.scrollLeft=0;
+    const width=element.clientWidth,content=element.scrollWidth;
+    element.scrollLeft=content;
+    return {width,content,left:element.scrollLeft};
+  });
+  assert.ok(result.content>result.width+10,marker+' must actually overflow');
+  assert.ok(result.left>10,marker+' must remain horizontally scrollable');
+  const bounds=await detail.boundingBox(),end=await target.boundingBox();
+  assert.ok(end.x+end.width<=bounds.x+bounds.width+2 && end.x+end.width>bounds.x,marker+' rightmost text is reachable');
+}
+
+test('wide tables, preformatted text, nowrap and minimum-width content retain horizontal access without page overflow',()=>withPage(async page=>{
+  await page.setViewportSize({width:1440,height:900});
+  const longText='Synthetic wide content '.repeat(35);
+  const details=[
+    '<table style="min-width:1900px"><tr><td>Left synthetic table cell</td><td style="text-align:right"><span>WIDE_TABLE_END</span></td></tr></table>',
+    '<pre style="white-space:pre">'+longText+'<span>WIDE_PRE_END</span></pre>',
+    '<div style="white-space:nowrap">'+longText+'<span>WIDE_NOWRAP_END</span></div>',
+    '<div style="min-width:1900px;text-align:right"><span>WIDE_MINIMUM_END</span></div>'
+  ];
+  await renderStudyFixture(page,details.map((DetailHtml,GlobalUID)=>({GlobalUID,QuestionType:'Blank',ChapterName:'Wide fixture',DetailHtml})));
+  await settleReader(page);
+  const original=await page.locator('.detail-box').allTextContents();
+  for(const marker of ['WIDE_TABLE_END','WIDE_PRE_END','WIDE_NOWRAP_END','WIDE_MINIMUM_END']) await assertHorizontalContentReachable(page,marker);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+  assert.deepEqual(await page.locator('.detail-box').allTextContents(),original);
+  await assertReaderGeometry(page,'wide rich content');
+}));
+
+test('orientation changes preserve newly overflowing content and restore ordinary full-width reading',()=>withPage(async page=>{
+  await page.setViewportSize({width:1440,height:900});
+  await renderStudyFixture(page,[
+    {GlobalUID:0,QuestionType:'Blank',ChapterName:'Orientation fixture',DetailHtml:'<p>Before orientation-sensitive content</p><div style="width:650px;padding:0 16px;text-align:right;white-space:nowrap"><span>ORIENTATION_RIGHT_END</span></div><p>After orientation-sensitive content</p>'},
+    {GlobalUID:1,QuestionType:'Blank',ChapterName:'Orientation fixture',DetailHtml:'<p>Next intact question</p>'}
+  ]);
+  const original=await page.locator('.detail-box').allTextContents();
+  const fits=()=>page.locator('.detail-box').first().evaluate(element=>element.scrollWidth<=element.clientWidth+1);
+  await settleReader(page);assert.equal(await fits(),true);
+  for(const viewport of [{width:390,height:844},{width:844,height:390}]) {
+    await page.setViewportSize(viewport);await settleReader(page);
+    if(viewport.width===390) await assertHorizontalContentReachable(page,'ORIENTATION_RIGHT_END');
+    await assertReaderGeometry(page,'orientation '+viewport.width);
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+  }
+  await page.setViewportSize({width:1440,height:900});await settleReader(page);
+  assert.equal(await fits(),true);
+  assert.equal(await page.locator('.detail-box').first().evaluate(element=>element.scrollLeft),0);
+  assert.deepEqual(await page.locator('.detail-box').allTextContents(),original);
+  await assertReaderGeometry(page,'wide orientation restored');
+}));
+
+test('percentage widths and padding survive late images and filtered restoration without overlapping later questions',()=>withPage(async page=>{
+  const fixture=await decodedImageFixture(page);
+  const rows=[
+    {GlobalUID:0,QuestionType:'Blank',ChapterName:'Keep',DetailHtml:'<div style="width:100%;padding:18px 24px"><p>Percentage and padding fixture</p><div style="width:100%"><img src="images/img_201.png" alt="Late percentage diagram"></div><p>After the late diagram</p></div>'},
+    {GlobalUID:1,QuestionType:'Blank',ChapterName:'Other',DetailHtml:'<p>Following unaffected question</p>'}
+  ];
+  const html=await page.evaluate(data=>{__test.setData(data);return __test.generateOfflineHtml(true);},rows);
+  let release;const gate=new Promise(resolve=>{release=resolve;});
+  await page.route('**/images/img_201.png',async route=>{await gate;await route.fulfill({contentType:'image/png',body:Buffer.from(fixture.png,'base64')});});
+  try {
+    await page.setContent(html,{waitUntil:'domcontentloaded'});await settleReader(page);
+    const before=await page.locator('.topic').nth(1).evaluate(card=>card.getBoundingClientRect().top+scrollY);
+    release();await page.waitForFunction(()=>document.querySelector('img[alt="Late percentage diagram"]').naturalWidth===400);
+    await settleReader(page);
+    const loaded=await page.locator('.topic').nth(1).evaluate(card=>card.getBoundingClientRect().top+scrollY);
+    assert.ok(loaded>before+100);
+    const check=async label=>{
+      await assertReaderGeometry(page,label);
+      const geometry=await page.evaluate(()=>{
+        const cards=[...document.querySelectorAll('.topic:not(.hidden)')];
+        const first=cards[0].getBoundingClientRect(),next=cards[1]?.getBoundingClientRect();
+        const image=document.querySelector('img[alt="Late percentage diagram"]'),rect=image.getBoundingClientRect(),parent=image.parentElement.getBoundingClientRect();
+        return {overlap:next?next.top<first.bottom:false,pageOverflow:document.documentElement.scrollWidth>innerWidth+1,
+          imageFits:rect.left>=parent.left-1&&rect.right<=parent.right+1,ratio:rect.width/rect.height};
+      });
+      assert.equal(geometry.overlap,false);assert.equal(geometry.pageOverflow,false);assert.equal(geometry.imageFits,true);assert.ok(Math.abs(geometry.ratio-2)<0.02);
+    };
+    await check('loaded percentage image');
+    await page.locator('#chapterFilter').selectOption('Other');await settleReader(page);
+    assert.equal(await page.locator('.topic').first().evaluate(card=>card.getBoundingClientRect().height),0);
+    await page.locator('#resetFilters').click();await settleReader(page);
+    assert.ok(Math.abs(await page.locator('.topic').nth(1).evaluate(card=>card.getBoundingClientRect().top+scrollY)-loaded)<=2);
+    await check('percentage fixture restored');
+    await page.setViewportSize({width:390,height:844});await settleReader(page);await check('narrow percentage image');
+    assert.equal(await page.locator('.detail-box img').getAttribute('alt'),'Late percentage diagram');
+    assert.match(await page.locator('.detail-box').first().textContent(),/After the late diagram/);
+  } finally {release();}
 }));

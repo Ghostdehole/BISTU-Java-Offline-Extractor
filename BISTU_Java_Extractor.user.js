@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.15.0
+// @version      7.16.0
 // @description  练习题干、选项与图片离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.15.0'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.16.0'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -1583,9 +1583,13 @@
             const safeClasses = Array.from(node.classList).filter(value => ['requirement-box', 'img-failed'].includes(value));
             const style = node.style;
             const safeStyles = [];
+            // Modern CSSOM enumerates white-space as longhands. Read the existing
+            // allowed shorthand explicitly so pre/nowrap survives sanitization.
+            const whiteSpace = style.getPropertyValue('white-space');
+            if (whiteSpace && !/url|expression|var\(|\\/i.test(whiteSpace) && /^[\w\s#(),.%+\-/"']+$/.test(whiteSpace)) safeStyles.push(`white-space:${whiteSpace}`);
             for (let index = 0; index < style.length; index++) {
                 const property = style[index]; const value = style.getPropertyValue(property);
-                if (/^(color|background-color|font-(size|family|weight|style)|text-(align|decoration)|white-space|vertical-align|border(-[a-z-]+)?|margin(-[a-z]+)?|padding(-[a-z]+)?|width|height|max-width|min-width|list-style-type)$/.test(property) &&
+                if (/^(color|background-color|font-(size|family|weight|style)|text-(align|decoration)|vertical-align|border(-[a-z-]+)?|margin(-[a-z]+)?|padding(-[a-z]+)?|width|height|max-width|min-width|list-style-type)$/.test(property) &&
                     !/url|expression|var\(|\\/i.test(value) && /^[\w\s#(),.%+\-/"']+$/.test(value)) safeStyles.push(`${property}:${value}`);
             }
             for (const attr of Array.from(node.attributes)) if (!attrs.has(attr.name)) node.removeAttribute(attr.name);
@@ -1638,6 +1642,9 @@
                         if (!node.hasAttribute('width')) node.setAttribute('width',String(dimensions.width));
                         if (!node.hasAttribute('height')) node.setAttribute('height',String(dimensions.height));
                         node.style.aspectRatio = dimensions.width + ' / ' + dimensions.height;
+                        // The reader selects its prefetch policy after parsing. Native
+                        // lazy loading prevents a hosted page from bursting every request.
+                        node.setAttribute('loading','lazy');
                     }
                     const originalUrl = safeUrl(original);
                     if (originalUrl) node.setAttribute('data-original', originalUrl);
@@ -1893,25 +1900,78 @@ offlineViewerRuntime();</script></body></html>`;
         if (narrow?.addEventListener) narrow.addEventListener('change', setFilterLayout);
         else if (narrow?.addListener) narrow.addListener(setFilterLayout);
         setFilterLayout();
-        document.querySelectorAll('.detail-box img, .answer-content img').forEach(img => {
+        function watchReaderImage(img, checkComplete = true) {
             const showMissing = () => {
+                if (!img.isConnected) return;
                 const message = document.createElement('div'); message.className = 'img-failed';
                 message.textContent = '离线图片缺失或无法解码。';
+                const localSource = img.getAttribute('src');
+                let retryable = false;
+                try {
+                    const url = new URL(localSource, document.baseURI);
+                    retryable = !!localSource && ((/^https?:$/.test(url.protocol) && url.origin === location.origin) ||
+                        (location.protocol === 'file:' && url.protocol === 'file:') ||
+                        /^data:image\/(png|jpe?g|gif|webp|bmp|avif);base64,[a-z0-9+/=\s]+$/i.test(localSource));
+                } catch (_) { /* Invalid or cross-origin sources only retain the manual source link. */ }
+                if (retryable) {
+                    const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'image-retry'; retry.textContent = '重试图片';
+                    retry.style.cssText = 'margin:6px 8px;padding:5px 9px;border:1px solid currentColor;border-radius:5px;background:transparent;color:inherit;font:inherit;cursor:pointer';
+                    retry.addEventListener('click', () => {
+                        retry.disabled = true;
+                        const fresh = img.cloneNode(false); fresh.removeAttribute('src');
+                        message.replaceWith(fresh); watchReaderImage(fresh, false);
+                        let source = localSource;
+                        try {
+                            const url = new URL(localSource, document.baseURI);
+                            if (/^https?:$/.test(url.protocol) && url.origin === location.origin) { url.searchParams.set('bistu-retry', String(Date.now())); source = url.href; }
+                        } catch (_) { /* Relative file and embedded image sources remain unchanged. */ }
+                        fresh.setAttribute('src', source);
+                    }, {once:true});
+                    message.append(' ', retry);
+                }
                 const original = img.getAttribute('data-original');
                 if (original) { const link = document.createElement('a'); link.href = original; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = '联网查看原图'; message.append(' ', link); }
                 img.replaceWith(message);
             };
             img.addEventListener('error', showMissing, {once:true});
-            if (img.complete && img.naturalWidth === 0) showMissing();
-        });
+            if (checkComplete && img.complete && img.naturalWidth === 0) showMissing();
+        }
+        document.querySelectorAll('.detail-box img, .answer-content img').forEach(img => watchReaderImage(img));
+        const readerImages = Array.from(document.querySelectorAll('.detail-box img,.answer-content img'));
+        const touchReading = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+        if (!touchReading && !/^https?:$/.test(location.protocol)) {
+            // Local desktop reading has no server request limit and benefits from
+            // known image geometry being available before cross-bank jumps.
+            readerImages.forEach(image => { image.loading = 'eager'; });
+        } else if (!touchReading) {
+            // Visible lazy images retain the browser's priority. Only two additional
+            // offscreen images are warmed at once; no remote source fallback is used.
+            let warmCursor = 0, warming = 0;
+            const warmNext = () => {
+                while (warming < 2 && warmCursor < readerImages.length) {
+                    const image = readerImages[warmCursor++];
+                    if (!image.isConnected || image.complete) continue;
+                    warming++;
+                    const settled = () => {
+                        image.removeEventListener('load',settled); image.removeEventListener('error',settled);
+                        warming--; warmNext();
+                    };
+                    image.addEventListener('load',settled,{once:true}); image.addEventListener('error',settled,{once:true});
+                    image.loading = 'eager';
+                }
+            };
+            warmNext();
+        }
         let preparingPrint = false;
         const PRINT_PREPARE_TIMEOUT_MS = 30000;
+        const PRINT_IMAGE_CONCURRENCY = 2;
+        const pendingPrintDecodes = new WeakMap();
         function loadPrintImages(signal) {
-            return Array.from(document.querySelectorAll('.detail-box img,.answer-content img'),image => {
-                image.loading = 'eager'; image.decoding = 'sync';
-                // Native beforeprint cannot await preparation: request images without
-                // retaining listeners. The explicit print path supplies cancellation.
-                if (!signal) return Promise.resolve();
+            const images = Array.from(document.querySelectorAll('.detail-box img,.answer-content img'));
+            // Native beforeprint cannot await preparation: request images without
+            // retaining listeners. Only the explicit print path queues decode work.
+            if (!signal) { images.forEach(image => { image.loading = 'eager'; }); return []; }
+            const prepareImage = image => {
                 return new Promise((resolve,reject) => {
                     let settled = false, decoding = false;
                     const finish = error => {
@@ -1927,13 +1987,31 @@ offlineViewerRuntime();</script></body></html>`;
                         if (settled || decoding) return;
                         decoding = true;
                         if (!image.naturalWidth || typeof image.decode !== 'function') { finish(); return; }
-                        Promise.resolve().then(() => image.decode()).then(() => finish(),() => finish());
+                        // HTMLImageElement.decode() cannot be aborted. Reuse an
+                        // unfinished decode if the user retries after our deadline.
+                        let pending = pendingPrintDecodes.get(image);
+                        if (!pending) {
+                            pending = Promise.resolve().then(() => image.decode());
+                            pendingPrintDecodes.set(image,pending);
+                            const forget = () => { if (pendingPrintDecodes.get(image) === pending) pendingPrintDecodes.delete(image); };
+                            pending.then(forget,forget);
+                        }
+                        pending.then(() => finish(),() => finish());
                     };
                     image.addEventListener('load',loaded,{once:true}); image.addEventListener('error',failed,{once:true});
                     signal.addEventListener('abort',aborted,{once:true});
+                    image.loading = 'eager'; image.decoding = 'sync';
                     if (signal.aborted) aborted(); else if (image.complete) loaded();
                 });
-            });
+            };
+            let cursor = 0;
+            const worker = async () => {
+                while (cursor < images.length) {
+                    if (signal.aborted) throw new Error('PRINT_PREPARATION_ABORTED');
+                    await prepareImage(images[cursor++]);
+                }
+            };
+            return Array.from({length:Math.min(PRINT_IMAGE_CONCURRENCY,images.length)},worker);
         }
         async function preparePrint() {
             if (preparingPrint) return;
