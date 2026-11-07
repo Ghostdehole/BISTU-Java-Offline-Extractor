@@ -214,6 +214,8 @@ test('offline search/type/difficulty filters, answer visibility and theme work w
   await page.locator('#keywordFilter').fill('');
   await page.locator('#diffFilter').selectOption('简单');
   await page.waitForFunction(() => document.getElementById('visibleCount').textContent === '1');
+  await page.locator('.topic:not(.hidden)').scrollIntoViewIfNeeded();
+  await page.waitForFunction(() => document.querySelector('.topic:not(.hidden)').innerText.includes('Alpha'));
   assert.match(await page.locator('.topic:not(.hidden)').innerText(), /Alpha/);
   await page.locator('#toggleAnsBtn').click();
   assert.equal(await page.locator('.topic:not(.hidden) .answer-box').isVisible(), false);
@@ -365,7 +367,7 @@ test('unpacked file:// export loads local images and works in a narrow viewport 
     await page.goto(pathToFileURL(path.join(folder, 'index.html')).href);
     await page.waitForFunction(() => document.querySelector('.detail-box img').naturalWidth === 1);
     if (await page.locator('#filterDetails').count() && await page.locator('#filterDetails').getAttribute('open') === null) await page.locator('#filterDetails > summary').click();
-    await page.locator('#sourceFilter').selectOption({ label: 'Second chapter' });
+    await page.locator('#chapterFilter').selectOption({ label: 'Second chapter' });
     await page.waitForFunction(() => document.getElementById('visibleCount').textContent === '1');
     assert.match(await page.locator('.topic:not(.hidden)').innerText(), /Beta local fixture/);
     assert.equal(await page.locator('.code-box').textContent(), 'String s = "&lt;literal&gt; &amp;";\nif (x < 2 && x > 0) {}');
@@ -1049,7 +1051,7 @@ test('study search normalizes Unicode, ANDs tokens, switches prompt scope and re
   assert.equal(await page.locator('#emptyState').isVisible(), true);
   await page.locator('#searchScope').selectOption('full');
   assert.equal(await page.locator('#visibleCount').textContent(), '1');
-  await page.locator('#sourceFilter').selectOption('数组');
+  await page.locator('#chapterFilter').selectOption('数组');
   await page.locator('#clearSearch').click();
   assert.equal(await page.locator('#visibleCount').textContent(), '2');
   await page.locator('#typeFilter').selectOption('Program');
@@ -1058,7 +1060,7 @@ test('study search normalizes Unicode, ANDs tokens, switches prompt scope and re
   assert.equal(await page.locator('#visibleCount').textContent(), '0');
   await page.locator('.empty-reset').click();
   assert.equal(await page.locator('#visibleCount').textContent(), '6');
-  for (const selector of ['#sourceFilter', '#typeFilter', '#diffFilter']) assert.equal(await page.locator(selector).inputValue(), 'all');
+  for (const selector of ['#sourceFilter', '#chapterFilter', '#typeFilter', '#diffFilter']) assert.equal(await page.locator(selector).inputValue(), 'all');
   assert.equal(await page.locator('#searchScope').inputValue(), 'full');
   assert.equal(await page.locator('#emptyState').isVisible(), false);
 }));
@@ -1140,8 +1142,8 @@ test('study layout supports mobile and desktop filters, both themes and no horiz
     assert.ok(layout.firstQuestion > layout.panelBottom, JSON.stringify(layout));
     if (width <= 900) {
       if (!(await page.locator('#filterDetails').evaluate(details => details.open))) await page.locator('#filterDetails summary').click();
-      assert.equal(await page.locator('#sourceFilter').isVisible(), true);
-      await page.locator('#sourceFilter').selectOption('数组');
+      assert.equal(await page.locator('#chapterFilter').isVisible(), true);
+      await page.locator('#chapterFilter').selectOption('数组');
       assert.equal(await page.locator('#visibleCount').textContent(), '2');
       await page.locator('#resetFilters').click();
     }
@@ -1289,4 +1291,92 @@ test('OCR errors and empty recognition leave AI unanswered until image text can 
   assert.equal(result[2].row.s3_done, true);
   assert.equal(result[2].row.ExtractionWarning, 'Keep this platform warning');
   assert.equal(result[2].calls, 2);
+}));
+
+test('original Illinois and regular sources retain exact classification, badges and independent chapter filters', () => withPage(async page => {
+  const rows = [
+    ['Single-choice', 'Single', '简单', 'alpha'],
+    ['Programming', 'Program', '挑战', 'alpha'],
+    ['基础', 'Single', '简单', 'beta'],
+    ['Programming', 'Multiple', '中等', 'beta'],
+    ['programming', 'Program', '一般', 'case-sensitive'],
+    [' Single-choice ', 'Blank', '困难', 'spaces'],
+    ['Single-choice-extra', 'Single', '挑战', 'suffix'],
+    ['伊利诺伊', 'Program', '新增难度', 'translated'],
+    [undefined, 'Blank', undefined, 'unclassified']
+  ].map(([ChapterName, QuestionType, DegreeLevel, text], GlobalUID) => ({ GlobalUID, ChapterName, QuestionType, DegreeLevel, DetailHtml: `<p>${text} synthetic source fixture</p>`, SniffedAnswer: 'Synthetic answer' }));
+  await renderStudyFixture(page, rows);
+  assert.deepEqual(new Set(await page.locator('#sourceFilter option').evaluateAll(options => options.map(option => option.value))), new Set(['all', 'normal', 'illinois']));
+  assert.equal(await page.locator('.topic[data-source="illinois"]').count(), 3);
+  assert.equal(await page.locator('.topic[data-source="normal"]').count(), 6);
+  for (const card of await page.locator('.topic[data-source="illinois"]').all()) assert.match(await card.locator('.question-head').innerText(), /伊利诺伊/);
+  for (const card of await page.locator('.topic[data-source="normal"]').all()) assert.doesNotMatch(await card.locator('.question-head').innerText(), /伊利诺伊/);
+  assert.equal(await page.locator('.offline-status').count(), 0);
+  assert.doesNotMatch(await page.locator('body').innerText(), /已保存到本地/);
+  const select = async (selector, value, count) => {
+    await page.locator(selector).selectOption(value);
+    await page.waitForFunction(expected => document.querySelector('#visibleCount').textContent === String(expected), count);
+  };
+  await select('#sourceFilter', 'illinois', 3);
+  await select('#chapterFilter', 'Programming', 2);
+  await select('#typeFilter', 'Program', 1);
+  await select('#diffFilter', '简单', 0);
+  assert.equal(await page.locator('#emptyState').isVisible(), true);
+  await page.locator('.empty-reset').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '9');
+  for (const selector of ['#sourceFilter', '#chapterFilter', '#typeFilter', '#diffFilter']) assert.equal(await page.locator(selector).inputValue(), 'all');
+  await select('#sourceFilter', 'normal', 6);
+  await select('#chapterFilter', '基础', 1);
+  await select('#typeFilter', 'Single', 1);
+  await select('#diffFilter', '简单', 1);
+  await studyQuery(page, 'beta', 1);
+  await select('#sourceFilter', 'illinois', 0);
+  await page.locator('.empty-reset').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '9');
+  assert.equal(await page.locator('#keywordFilter').inputValue(), '');
+  assert.equal(await page.locator('#searchScope').inputValue(), 'full');
+  assert.equal(await page.locator('#emptyState').isVisible(), false);
+}));
+
+test('difficulty options retain the original learning order and append unfamiliar levels', () => withPage(async page => {
+  const levels = ['挑战', '中等', '简单', '新增难度', '困难', '一般', undefined];
+  await renderStudyFixture(page, levels.map((DegreeLevel, GlobalUID) => ({ GlobalUID, QuestionType: 'Blank', ChapterName: 'Synthetic chapter', DegreeLevel, DetailHtml: '<p>Synthetic difficulty fixture</p>' })));
+  const options = await page.locator('#diffFilter option').evaluateAll(nodes => nodes.map(node => node.value));
+  assert.deepEqual(options.slice(0, 6), ['all', '简单', '一般', '中等', '困难', '挑战']);
+  assert.deepEqual(new Set(options.slice(6)), new Set(['新增难度', '无']));
+  for (const value of levels.filter(Boolean).concat('无')) {
+    await page.locator('#diffFilter').selectOption(value);
+    await page.waitForFunction(() => document.querySelector('#visibleCount').textContent === '1');
+    assert.equal(await page.locator('.topic:not(.hidden)').getAttribute('data-diff'), value);
+  }
+}));
+
+test('full search includes original source badges and question numbers while phrase mode retains contiguous matching', () => withPage(async page => {
+  await renderStudyFixture(page, [
+    { GlobalUID: 0, QuestionType: 'Single', ChapterName: 'Single-choice', DegreeLevel: '简单', DetailHtml: '<p>alpha beta</p>', SniffedAnswer: 'Fixture answer' },
+    { GlobalUID: 1, QuestionType: 'Single', ChapterName: 'Synthetic chapter', DegreeLevel: '一般', DetailHtml: '<p>alpha middle beta</p>', SniffedAnswer: 'Fixture answer' },
+    { GlobalUID: 2, QuestionType: 'Program', ChapterName: 'Programming', DegreeLevel: '中等', DetailHtml: '<p>different prompt</p>', SniffedAnswer: 'answerOnlyFixtureToken', AnswerSource: 'platform-reference' }
+  ]);
+  await studyQuery(page, '伊利诺伊', 2);
+  assert.deepEqual(await page.locator('.topic:not(.hidden)').evaluateAll(cards => cards.map(card => card.dataset.source)), ['illinois', 'illinois']);
+  await studyQuery(page, '002', 1);
+  assert.equal(await page.locator('.topic:not(.hidden) .question-number').textContent(), '002');
+  await studyQuery(page, '2.', 1);
+  assert.equal(await page.locator('.topic:not(.hidden) .question-number').textContent(), '002');
+  await studyQuery(page, 'alpha beta', 2);
+  assert.equal(await page.locator('#searchMatch').inputValue(), 'terms');
+  await page.locator('#searchMatch').selectOption('phrase');
+  assert.equal(await page.locator('#visibleCount').textContent(), '1');
+  assert.equal(await page.locator('.topic:not(.hidden) .question-number').textContent(), '001');
+  await page.locator('#searchMatch').selectOption('terms');
+  assert.equal(await page.locator('#visibleCount').textContent(), '2');
+  await studyQuery(page, 'answerOnlyFixtureToken', 1);
+  await page.locator('#searchScope').selectOption('prompt');
+  assert.equal(await page.locator('#visibleCount').textContent(), '0');
+  await page.locator('#searchMatch').selectOption('phrase');
+  await page.locator('.empty-reset').click();
+  assert.equal(await page.locator('#searchMatch').inputValue(), 'terms');
+  assert.equal(await page.locator('#searchScope').inputValue(), 'full');
+  assert.equal(await page.locator('#keywordFilter').inputValue(), '');
+  assert.equal(await page.locator('#visibleCount').textContent(), '3');
 }));
