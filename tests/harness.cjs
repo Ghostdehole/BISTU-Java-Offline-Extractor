@@ -15,6 +15,9 @@ function instrument(source) {
       runStage1, runStage2, runStage3, runStage4, runEngine,
       buildZipAndDownload, generateOfflineHtml, initializePlatformVariables,
       runWithConcurrency, keyManager,
+      getSettings: typeof getSettings === 'function' ? getSettings : undefined,
+      reconcilePlatformAnswer: typeof reconcilePlatformAnswer === 'function' ? reconcilePlatformAnswer : undefined,
+      requestDeepSeek: typeof requestDeepSeek === 'function' ? requestDeepSeek : undefined,
       restorePlatformVariables: typeof restorePlatformVariables === 'function' ? restorePlatformVariables : undefined,
       validateImageBuffer: typeof validateImageBuffer === 'function' ? validateImageBuffer : undefined,
       get state() { return globalState; },
@@ -59,6 +62,18 @@ async function createHarness(browser, sourceOverride, fixtureHtml) {
     window.__zips = [];
     window.__values = { '#select_LanguageType': 'Java', '#select_DegreeLevel': [], '#select_KnoGuid': [], '#input_Search': '' };
     window.__chapters = [];
+    window.__setSettings = values => {
+      for (const [name, value] of Object.entries(values)) {
+        const input = document.getElementById('bistu-setting-' + name);
+        if (!input) throw new Error('Missing setting control: ' + name);
+        if (input.type === 'checkbox') input.checked = !!value;
+        else input.value = String(value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    };
+    window.__aiResponse = (content = 'Synthetic answer', usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }) =>
+      Response.json({ id: 'synthetic-completion', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content } }], usage });
     window.$ = selector => ({ val: () => window.__values[selector] });
     $.fn = { zTree: { getZTreeObj: () => ({ getSelectedNodes: () => window.__chapters }) } };
     $.ajax = options => {

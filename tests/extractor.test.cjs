@@ -27,6 +27,7 @@ test('five question types: scans, preserves requirements, finds associated label
       }
       if (url.includes('JumpToPracticeTopic')) {
         const type = new URL(url, location.origin).searchParams.get('QuestionType');
+        if (type === 'Blank' || type === 'Program') return `<input id="hidden_TopicGuid" value="fixture-${type}"><div class="panel"><div class="panel-heading">多选题练习</div><div class="panel-body"><p>synthetic ${type}</p><pre>Required output: 42</pre></div><ul class="list-group">${type === 'Blank' ? '<li><input type="text" name="UserSelect"></li>' : ''}</ul></div>`;
         const inputType = type === 'Multiple' ? 'checkbox' : 'radio';
         return `<form><input type="hidden" name="Guid" value="fixture-${type}"><h2>Synthetic ${type}</h2><input id="option-a" type="${inputType}" name="UserSelect" value="A&amp;B=1"><label for="option-a">Correct ${type}<img src="/fixtures/answer.png"></label><label><input type="${inputType}" name="UserSelect" value="B + 2">Second option</label></form>`;
       }
@@ -145,7 +146,7 @@ test('pause ZIP then final ZIP both retain identical image bytes and extraction 
     __test.state.stage = 4;
     __test.state.sourceTotals = { Single: 1, Program: 1 };
     __test.setData([
-      { GlobalUID: 0, TopicGuid: 'report-single', QuestionType: 'Single', s2_done: true, DetailHtml: '<p>Report fixture</p>', SniffedAnswer: 'A' },
+      { GlobalUID: 0, TopicGuid: 'report-single', QuestionType: 'Single', s2_done: true, DetailHtml: '<p>Report fixture</p>', SniffedAnswer: 'A', AnswerSource: 'platform-verified' },
       { GlobalUID: 1, TopicGuid: 'report-program', QuestionType: 'Program', s2_done: true, DetailHtml: '<p>Report program fixture</p>', SniffedAnswer: 'class Report {}', AnswerSource: 'platform-reference' }
     ]);
     __test.setImages([['http://fixture.test/picture.png', { filename: 'img_1.png', buffer: new Uint8Array([1, 2, 3, 4]).buffer, downloaded: true, failed: false }]]);
@@ -518,7 +519,7 @@ test('offline warnings remain visible when answers are hidden and summary distin
     __test.setData([
       { GlobalUID: 0, QuestionType: 'Single', DetailHtml: '<p>Unavailable choice fixture</p>', ExtractionWarning: 'Synthetic missing options <img src=x onerror="alert(1)">', NeedsAI: false, SniffedAnswer: '' },
       { GlobalUID: 1, QuestionType: 'Program', DetailHtml: '<p>Reference program fixture</p>', AnswerSource: 'platform-reference', SniffedAnswer: 'class Fixture {}', IsAIAnswer: false },
-      { GlobalUID: 2, QuestionType: 'Single', DetailHtml: '<p>Validated choice fixture</p>', SniffedAnswer: 'A' },
+      { GlobalUID: 2, QuestionType: 'Single', DetailHtml: '<p>Validated choice fixture</p>', SniffedAnswer: 'A', AnswerSource: 'platform-verified' },
       { GlobalUID: 3, QuestionType: 'Blank', DetailHtml: '<p>AI fixture</p>', SniffedAnswer: 'synthetic AI text', IsAIAnswer: true },
       { GlobalUID: 4, QuestionType: 'Single', DetailHtml: '<p>Second missing choice fixture</p>', ExtractionWarning: 'Synthetic second missing options', NeedsAI: false, SniffedAnswer: '' }
     ]);
@@ -866,7 +867,7 @@ test('temporary image failures finish the bounded queue before pausing and mixed
   });
   assert.equal(result.stage, 4);
   assert.equal(result.paused, true);
-  assert.equal(result.maxActive, 3);
+  assert.equal(result.maxActive, 6);
   assert.equal(Object.keys(result.attempts).length, 6, 'later images are attempted despite earlier failures');
   assert.ok(result.images.slice(0, 3).every(image => image.failed && !image.sourceUnavailable && !image.downloaded));
   assert.ok(result.images.slice(3).every(image => image.downloaded && !image.failed));
@@ -1215,7 +1216,7 @@ test('AI skips unavailable question images while other answers and stage 4 compl
     __fetch = async (target, options) => {
       calls.push({ target, body: options?.body });
       if (target === url) return new Response('', { status: 404 });
-      return Response.json({ choices: [{ message: { content: 'Synthetic text answer' } }] });
+      return __aiResponse('Synthetic text answer');
     };
     await __test.runEngine();
     return { rows: __test.data, calls, state: __test.state,
@@ -1244,13 +1245,13 @@ test('reimporting an unanswered missing-image snapshot deduplicates AI warnings 
   const state = snapshot();
   state.globalState.stage = 5;
   state.imgCounter = 2;
-  state.allData = [{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'resume-fixture', Title: 'Resume fixture', DetailHtml: '<p>Image required</p><img src="images/img_1.png">', imgUrls: ['http://fixture.test/missing.png'], NeedsAI: true, s2_done: true, s3_done: false, ExtractionWarning: 'Existing platform warning' }];
+  state.allData = [{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'resume-fixture', Title: 'Resume fixture', DetailHtml: '<p>Image required</p><img src="images/img_1.png">', imgUrls: ['http://fixture.test/missing.png'], NeedsAI: true, s2_done: true, s3_done: false, PlatformDetailChecked: true, ExtractionWarning: 'Existing platform warning' }];
   state.imageQueueList = [['http://fixture.test/missing.png', { filename: 'img_1.png', downloaded: false, failed: false, sourceUnavailable: true, status: 404 }]];
   await page.evaluate(() => {
     document.getElementById('bistu-apikey').value = 'synthetic-test-key';
     window.__aiCalls = 0;
     __fetch = async target => {
-      if (target.includes('deepseek.com')) { __aiCalls++; return Response.json({ choices: [{ message: { content: 'Synthetic recovered answer' } }] }); }
+      if (target.includes('deepseek.com')) { __aiCalls++; return __aiResponse('Synthetic recovered answer'); }
       if (!window.__imageRecovered) return new Response('', { status: 404 });
       const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
       return new Response(png, { headers: { 'Content-Type': 'image/png' } });
@@ -1277,7 +1278,7 @@ test('reimporting an unanswered missing-image snapshot deduplicates AI warnings 
   assert.equal(recovered.row.s3_done, true);
   assert.equal(recovered.row.SniffedAnswer, 'Synthetic recovered answer');
   assert.equal(recovered.row.ExtractionWarning, 'Existing platform warning');
-  assert.equal(recovered.calls, 2); // OCR correction and answer, both synthetic.
+  assert.equal(recovered.calls, 1); // Default vision submits one complete image/question request.
   assert.equal(recovered.image.sourceUnavailable, false);
   assert.equal(recovered.report.complete, true);
   assert.equal(recovered.report.imagesComplete, true);
@@ -1285,6 +1286,7 @@ test('reimporting an unanswered missing-image snapshot deduplicates AI warnings 
 
 test('OCR errors and empty recognition leave AI unanswered until image text can be read', () => withPage(async page => {
   const result = await page.evaluate(async () => {
+    __setSettings({ imageMode: 'ocr', ocrClean: false });
     __test.keyManager.updateKeys('synthetic-test-key');
     const url = 'http://fixture.test/picture.png';
     const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0)).buffer;
@@ -1295,7 +1297,7 @@ test('OCR errors and empty recognition leave AI unanswered until image text can 
       if (mode === 'throw') throw new Error('Synthetic OCR failure');
       return { data: { text: mode === 'empty' ? '' : 'Synthetic OCR text' } };
     } });
-    __fetch = async () => { calls++; return Response.json({ choices: [{ message: { content: 'Synthetic answer' } }] }); };
+    __fetch = async () => { calls++; return __aiResponse('Synthetic answer'); };
     const attempts = [];
     for (mode of ['throw', 'empty', 'valid']) {
       __test.state.stage = 3; __test.state.isPaused = false;
@@ -1314,7 +1316,7 @@ test('OCR errors and empty recognition leave AI unanswered until image text can 
   }
   assert.equal(result[2].row.s3_done, true);
   assert.equal(result[2].row.ExtractionWarning, 'Keep this platform warning');
-  assert.equal(result[2].calls, 2);
+  assert.equal(result[2].calls, 1);
 }));
 
 test('original Illinois and regular sources retain exact classification, badges and independent chapter filters', () => withPage(async page => {
@@ -1542,4 +1544,621 @@ test('narrow-screen prompt and answer images retain natural proportions despite 
       assert.ok(Math.abs(image.width / image.height - image.naturalWidth / image.naturalHeight) < 0.01, JSON.stringify(image));
     }
   }
+}));
+
+test('AI settings expose every default in the UI and read valid user changes', () => withPage(async page => {
+  const defaults = {
+    listConcurrency: 6, detailConcurrency: 6, aiConcurrency: 6, imageConcurrency: 6,
+    pageSize: 10, platformTimeoutMs: 30000, platformAttempts: 3, platformDelayMs: 100,
+    imageAttempts: 3, imageRetryDelayMs: 500, perKeyConcurrency: 2, aiAttempts: 3,
+    aiTimeoutMs: 180000, aiRetryDelayMs: 1000, model: 'deepseek-flash', programModel: 'deepseek-v4-pro',
+    visionModel: 'deepseek-flash', thinking: 'enabled', reasoningEffort: 'high', maxTokens: 32768,
+    temperature: 0.2, imageMode: 'vision', ocrClean: false
+  };
+  const initial = await page.evaluate(names => ({
+    settings: __test.getSettings(),
+    controls: names.map(name => {
+      const input = document.getElementById('bistu-setting-' + name);
+      return { name, present: !!input, value: input?.type === 'checkbox' ? input.checked : input?.value };
+    })
+  }), Object.keys(defaults));
+  for (const [name, value] of Object.entries(defaults)) {
+    assert.equal(initial.settings[name], value, name);
+    const control = initial.controls.find(control => control.name === name);
+    assert.equal(control.present, true, name);
+    assert.equal(String(control.value), String(value), name);
+  }
+  const changes = { aiConcurrency: 4, perKeyConcurrency: 1, pageSize: 7, aiAttempts: 1,
+    thinking: 'disabled', imageMode: 'ocr', ocrClean: true, maxTokens: 1024, temperature: 0.6 };
+  const updated = await page.evaluate(values => { __setSettings(values); return __test.getSettings(); }, changes);
+  for (const [name, value] of Object.entries(changes)) assert.equal(updated[name], value, name);
+}));
+
+test('AI settings reject invalid concurrency, page size and generation values before requests', () => withPage(async page => {
+  const result = await page.evaluate(() => {
+    const badValues = [['aiConcurrency', 0], ['aiConcurrency', 33], ['perKeyConcurrency', 0],
+      ['pageSize', 101], ['pageSize', 1.5], ['multipleMaxOptions', 21], ['maxTokens', -1], ['temperature', '']];
+    return badValues.map(([field, value]) => {
+      const input = document.getElementById('bistu-setting-' + field);
+      if (!input) throw new Error('Missing setting control: ' + field);
+      const old = input.value; input.value = String(value);
+      let error; try { __test.getSettings(); } catch (caught) { error = caught.message; }
+      input.value = old;
+      return { field, rejected: !!error };
+    });
+  });
+  assert.ok(result.every(result => result.rejected), JSON.stringify(result));
+}));
+
+test('AI reconciles platform references and never overwrites any already valid answer', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 3;
+    __test.keyManager.updateKeys('synthetic-priority-key');
+    const common = { s2_done: true, s3_done: false, NeedsAI: true, PlatformDetailChecked: true, imgUrls: [] };
+    __test.setData([
+      { ...common, GlobalUID: 0, TopicGuid: 'verified', QuestionType: 'Single', DetailHtml: '<p>Verified fixture</p>', SniffedAnswer: 'Original verified answer', AnswerSource: 'platform-verified', IsAIAnswer: false },
+      { ...common, GlobalUID: 1, TopicGuid: 'program-reference', QuestionType: 'Program', DetailHtml: '<p>Reference fixture</p>', PlainExample: '\r\nclass Official {}\r\n', SniffedAnswer: 'class OldAI {}', AnswerSource: 'ai', IsAIAnswer: true },
+      { ...common, GlobalUID: 2, TopicGuid: 'existing-ai', QuestionType: 'Blank', DetailHtml: '<p>Existing AI fixture</p>', SniffedAnswer: 'Existing valid AI answer', AnswerSource: 'ai', IsAIAnswer: true, s3_done: true },
+      { ...common, GlobalUID: 3, TopicGuid: 'missing', QuestionType: 'Blank', DetailHtml: '<p>Missing answer fixture</p>', SniffedAnswer: '   ', IsAIAnswer: false, s3_done: true }
+    ]);
+    const bodies = [];
+    __fetch = async (url, options) => { bodies.push(JSON.parse(options.body)); return __aiResponse('New missing answer'); };
+    await __test.runStage3();
+    return { rows: __test.data, bodies, stage: __test.state.stage, paused: __test.state.isPaused };
+  });
+  assert.equal(result.rows[0].SniffedAnswer, 'Original verified answer');
+  assert.equal(result.rows[0].AnswerSource, 'platform-verified');
+  assert.equal(result.rows[1].SniffedAnswer, '\r\nclass Official {}\r\n');
+  assert.equal(result.rows[1].AnswerSource, 'platform-reference');
+  assert.equal(result.rows[1].IsAIAnswer, false);
+  assert.equal(result.rows[2].SniffedAnswer, 'Existing valid AI answer');
+  assert.equal(result.rows[3].SniffedAnswer, 'New missing answer');
+  assert.equal(result.rows[3].s3_done, true);
+  assert.equal(result.bodies.length, 1);
+  assert.match(JSON.stringify(result.bodies[0].messages), /Missing answer fixture/);
+  assert.equal(result.paused, false);
+  assert.equal(result.stage, 4);
+}));
+
+test('AI deduplicates arbitrary key counts and fairly rotates every healthy key', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1 });
+    const keys = Array.from({ length: 17 }, (_, index) => 'synthetic-fair-key-' + index);
+    __test.keyManager.updateKeys(keys.join('\n') + '\n' + keys.slice(0, 4).join('，') + ';' + keys[0]);
+    __test.state.stage = 3;
+    __test.setData(Array.from({ length: 51 }, (_, GlobalUID) => ({ GlobalUID, TopicGuid: 'fair-' + GlobalUID,
+      QuestionType: 'Blank', DetailHtml: '<p>Synthetic fair fixture ' + GlobalUID + '</p>', s2_done: true,
+      PlatformDetailChecked: true, NeedsAI: true, s3_done: false, imgUrls: [] })));
+    const assignments = [];
+    __fetch = async (_, options) => { assignments.push(options.headers.Authorization.replace(/^Bearer /, '')); return __aiResponse(); };
+    await __test.runStage3();
+    return { assignments, uniqueKeys: __test.keyManager.getCount(), completed: __test.data.filter(row => row.s3_done).length };
+  });
+  assert.equal(result.uniqueKeys, 17);
+  assert.equal(result.completed, 51);
+  assert.equal(result.assignments.length, 51);
+  assert.equal(new Set(result.assignments.slice(0, 17)).size, 17);
+  const counts = new Map();
+  for (const key of result.assignments) counts.set(key, (counts.get(key) || 0) + 1);
+  assert.equal(counts.size, 17);
+  assert.ok([...counts.values()].every(count => count === 3));
+}));
+
+test('AI scans beyond ten rejected keys and disables authentication/quota failures', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiRetryDelayMs: 0 });
+    const keys = Array.from({ length: 17 }, (_, index) => 'synthetic-health-key-' + index);
+    __test.keyManager.updateKeys(keys.join('\n'));
+    __test.state.stage = 3;
+    __test.setData(Array.from({ length: 2 }, (_, GlobalUID) => ({ GlobalUID, TopicGuid: 'health-' + GlobalUID,
+      QuestionType: 'Blank', DetailHtml: '<p>Synthetic key health fixture</p>', s2_done: true,
+      PlatformDetailChecked: true, NeedsAI: true, s3_done: false, imgUrls: [] })));
+    const assignments = [];
+    __fetch = async (_, options) => {
+      const key = options.headers.Authorization.replace(/^Bearer /, ''); assignments.push(key);
+      const index = keys.indexOf(key);
+      return index === 16 ? __aiResponse() : new Response('', { status: index % 2 ? 401 : 402 });
+    };
+    await __test.runStage3();
+    return { assignments, completed: __test.data.filter(row => row.s3_done).length, paused: __test.state.isPaused, outOfKeys: __test.state.outOfKeys };
+  });
+  assert.equal(result.completed, 2);
+  assert.equal(result.paused, false);
+  assert.equal(result.outOfKeys, false);
+  for (let index = 0; index < 16; index++) assert.equal(result.assignments.filter(key => key === 'synthetic-health-key-' + index).length, 1);
+  assert.equal(result.assignments.filter(key => key === 'synthetic-health-key-16').length, 2);
+}));
+
+test('AI starts six workers by default and respects the per-key lease limit', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.keyManager.updateKeys('synthetic-concurrency-1\nsynthetic-concurrency-2\nsynthetic-concurrency-3\nsynthetic-concurrency-4');
+    __test.state.stage = 3;
+    __test.setData(Array.from({ length: 24 }, (_, GlobalUID) => ({ GlobalUID, TopicGuid: 'concurrent-' + GlobalUID,
+      QuestionType: 'Blank', DetailHtml: '<p>Synthetic concurrency fixture</p>', s2_done: true,
+      PlatformDetailChecked: true, NeedsAI: true, s3_done: false, imgUrls: [] })));
+    let active = 0, maxActive = 0;
+    const byKey = new Map(), maxima = new Map();
+    __fetch = async (_, options) => {
+      const key = options.headers.Authorization;
+      active++; maxActive = Math.max(maxActive, active); byKey.set(key, (byKey.get(key) || 0) + 1);
+      maxima.set(key, Math.max(maxima.get(key) || 0, byKey.get(key)));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      active--; byKey.set(key, byKey.get(key) - 1); return __aiResponse();
+    };
+    await __test.runStage3();
+    return { maxActive, maxPerKey: Math.max(...maxima.values()), active, remainingPerKey: Array.from(byKey.values()), completed: __test.data.filter(row => row.s3_done).length };
+  });
+  assert.equal(result.maxActive, 6);
+  assert.ok(result.maxPerKey <= 2);
+  assert.equal(result.active, 0);
+  assert.ok(result.remainingPerKey.every(count => count === 0));
+  assert.equal(result.completed, 24);
+}));
+
+test('default vision sends one complete question request and never invokes OCR cleaning', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.keyManager.updateKeys('synthetic-vision-key'); __test.state.stage = 3;
+    const url = 'http://fixture.test/vision-picture.png';
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0)).buffer;
+    __test.setImages([[url, { filename: 'img_1.png', buffer: png, downloaded: true }]]);
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'vision-fixture', QuestionType: 'Blank', DetailHtml: '<p>Read this synthetic figure</p><img src="images/img_1.png">',
+      imgUrls: [url], s2_done: true, PlatformDetailChecked: true, s3_done: false, NeedsAI: true }]);
+    let ocrCalls = 0; Tesseract.createWorker = async () => { ocrCalls++; throw new Error('Default vision must not initialize OCR'); };
+    const bodies = [];
+    __fetch = async (_, options) => { bodies.push(JSON.parse(options.body)); return __aiResponse('Synthetic visual answer'); };
+    await __test.runStage3();
+    return { bodies, ocrCalls, row: __test.data[0], paused: __test.state.isPaused };
+  });
+  assert.equal(result.bodies.length, 1);
+  assert.equal(result.ocrCalls, 0);
+  assert.equal(result.bodies[0].model, 'deepseek-flash');
+  const content = result.bodies[0].messages.find(message => message.role === 'user').content;
+  assert.ok(Array.isArray(content));
+  assert.ok(content.some(part => part.type === 'text' && /Read this synthetic figure/.test(part.text)));
+  assert.equal(content.filter(part => part.type === 'image_url').length, 1);
+  assert.match(content.find(part => part.type === 'image_url').image_url.url, /^data:image\/[a-z0-9.+-]+;base64,/i);
+  assert.equal(result.row.SniffedAnswer, 'Synthetic visual answer');
+  assert.equal(result.row.s3_done, true);
+  assert.equal(result.paused, false);
+}));
+
+test('direct platform answer reconciliation is explicit, preserves code and never guesses unknown schemas', () => withPage(async page => {
+  const result = await page.evaluate(() => {
+    const detail = '<label><input type="checkbox" value="A&amp;B=1">First exact option</label><label><input type="checkbox" value="C">Second exact option</label>';
+    const rows = [
+      { QuestionType: 'Single', Answer: 'A&B=1', DetailHtml: detail },
+      { QuestionType: 'Multiple', Answer: ['A&B=1', 'C'], DetailHtml: detail },
+      { QuestionType: 'Multiple', Answer: 'A&B=1,C', DetailHtml: detail },
+      { QuestionType: 'TrueOrFalse', Answer: false, DetailHtml: '<label><input type="radio" value="TRUE">True label</label><label><input type="radio" value="FALSE">False label</label>' },
+      { QuestionType: 'Blank', Answer: false },
+      { QuestionType: 'Blank', Answer: 0 },
+      { QuestionType: 'Program', PlainExample: '\r\nclass PlatformReference {}\r\n', Answer: 'lower priority' },
+      { QuestionType: 'Single', Answer: { value: 'A&B=1' }, DetailHtml: detail },
+      { QuestionType: 'Single', Answer: 1, DetailHtml: detail },
+      { QuestionType: 'Single', Answer: 'A', DetailHtml: '<label><input type="radio" value="A">One</label><label><input type="radio" value="A">Two</label>' }
+    ];
+    return rows.map(row => ({ resolved: __test.reconcilePlatformAnswer(row), row }));
+  });
+  for (const index of [0, 1, 3, 4, 5, 6]) {
+    assert.equal(result[index].resolved, true, String(index));
+    assert.equal(result[index].row.NeedsAI, false);
+    assert.equal(result[index].row.IsAIAnswer, false);
+  }
+  assert.match(result[0].row.SniffedAnswer, /First exact option/);
+  assert.match(result[1].row.SniffedAnswer, /First exact option[\s\S]*Second exact option/);
+  assert.match(result[3].row.SniffedAnswer, /False label/);
+  assert.match(result[4].row.SniffedAnswer, /false/);
+  assert.match(result[5].row.SniffedAnswer, /0/);
+  assert.equal(result[6].row.SniffedAnswer, '\r\nclass PlatformReference {}\r\n');
+  assert.equal(result[6].row.AnswerSource, 'platform-reference');
+  for (const index of [2, 7, 8, 9]) {
+    assert.equal(result[index].resolved, false, String(index));
+    assert.equal(result[index].row.PlatformAnswerUnresolved, true);
+    assert.equal(result[index].row.NeedsAI, false);
+    assert.equal(result[index].row.SniffedAnswer, undefined);
+  }
+}));
+
+test('platform direct choices and subjective answers bypass answer submissions and AI', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.keyManager.updateKeys('synthetic-platform-priority-key');
+    __test.state.stage = 2;
+    __test.setData([
+      { GlobalUID: 0, TopicGuid: 'direct-choice', QuestionType: 'Single', Title: 'Direct choice', Answer: 'A', s2_done: false },
+      { GlobalUID: 1, TopicGuid: 'direct-blank', QuestionType: 'Blank', Title: 'Direct blank', Answer: '<literal> & 0', s2_done: false },
+      { GlobalUID: 2, TopicGuid: 'direct-program', QuestionType: 'Program', Title: 'Direct program', PlainExample: 'class Platform {}', s2_done: false }
+    ]);
+    __respond = ({ url, type }) => {
+      if (type === 'post') throw new Error('A direct platform answer must not be submitted again');
+      if (!url.includes('direct-choice')) throw new Error('Known subjective platform answers need no detail fallback');
+      return '<form><input name="Guid" type="hidden" value="direct-choice"><label><input type="radio" value="A">Platform option A</label><label><input type="radio" value="B">Option B</label></form>';
+    };
+    let aiCalls = 0; __fetch = async () => { aiCalls++; return __aiResponse(); };
+    await __test.runStage2(); await __test.runStage3();
+    return { rows: __test.data, aiCalls, submissions: __ajaxCalls.filter(call => call.method === 'post').length, paused: __test.state.isPaused };
+  });
+  assert.equal(result.aiCalls, 0);
+  assert.equal(result.submissions, 0);
+  assert.equal(result.paused, false);
+  assert.ok(result.rows.every(row => row.s2_done && row.NeedsAI === false));
+  assert.match(result.rows[1].SniffedAnswer, /&lt;literal&gt; &amp; 0/);
+  assert.equal(result.rows[2].AnswerSource, 'platform-reference');
+}));
+
+test('AI refuses truncated, filtered, tool, refusal, blank and malformed responses and releases its lease', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiAttempts: 1, aiRetryDelayMs: 0 });
+    __test.keyManager.updateKeys('synthetic-invalid-response-key');
+    const cases = [
+      ['length', { choices: [{ finish_reason: 'length', message: { content: 'Truncated code' } }] }],
+      ['content_filter', { choices: [{ finish_reason: 'content_filter', message: { content: 'Filtered response' } }] }],
+      ['tool_calls', { choices: [{ finish_reason: 'tool_calls', message: { content: 'Tool request', tool_calls: [{ id: 'synthetic-tool' }] } }] }],
+      ['refusal', { choices: [{ finish_reason: 'stop', message: { content: 'Refused', refusal: 'Synthetic refusal marker' } }] }],
+      ['blank', { choices: [{ finish_reason: 'stop', message: { content: ' \n\t ' } }] }],
+      ['missing_choices', { result: 'not a completion' }],
+      ['missing_finish_reason', { choices: [{ message: { content: 'Missing completion boundary' } }] }],
+      ['invalid_json', null]
+    ];
+    const results = [];
+    for (const [name, response] of cases) {
+      __test.state.stage = 3; __test.state.isPaused = false;
+      __test.setData([{ GlobalUID: 0, TopicGuid: 'response-' + name, QuestionType: 'Blank', DetailHtml: '<p>Synthetic bad response fixture</p>',
+        PlatformDetailChecked: true, s2_done: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
+      __fetch = async () => response ? Response.json(response) : new Response('synthetic invalid JSON', { headers: { 'Content-Type': 'application/json' } });
+      await __test.runStage3();
+      results.push({ name, completed: __test.data[0].s3_done, answer: __test.data[0].SniffedAnswer, paused: __test.state.isPaused, stage: __test.state.stage });
+    }
+    __test.state.isPaused = false;
+    __fetch = async () => __aiResponse('Recovered on the same key');
+    await Promise.race([__test.runStage3(), new Promise((_, reject) => setTimeout(() => reject(new Error('A failed response leaked a key lease')), 2000))]);
+    return { results, recovered: __test.data[0] };
+  });
+  for (const attempt of result.results) {
+    assert.notEqual(attempt.completed, true, attempt.name);
+    assert.ok(!attempt.answer, attempt.name);
+    assert.equal(attempt.paused, true, attempt.name);
+    assert.equal(attempt.stage, 3, attempt.name);
+  }
+  assert.equal(result.recovered.SniffedAnswer, 'Recovered on the same key');
+  assert.equal(result.recovered.s3_done, true);
+}));
+
+test('AI rate limiting cools down the pool without declaring keys exhausted', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiAttempts: 3, aiRetryDelayMs: 0 });
+    __test.keyManager.updateKeys('synthetic-rate-key-1\nsynthetic-rate-key-2');
+    __test.state.stage = 3;
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'rate-fixture', QuestionType: 'Blank', DetailHtml: '<p>Rate-limit fixture</p>',
+      PlatformDetailChecked: true, s2_done: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
+    const times = [];
+    __fetch = async () => { times.push(performance.now()); return times.length === 1 ? new Response('', { status: 429, headers: { 'Retry-After': '1' } }) : __aiResponse('Rate recovered'); };
+    await __test.runStage3();
+    return { attempts: times.length, waitMs: times[1] - times[0], paused: __test.state.isPaused, outOfKeys: __test.state.outOfKeys, row: __test.data[0] };
+  });
+  assert.equal(result.attempts, 2);
+  assert.ok(result.waitMs >= 900, String(result.waitMs));
+  assert.equal(result.paused, false);
+  assert.equal(result.outOfKeys, false);
+  assert.equal(result.row.SniffedAnswer, 'Rate recovered');
+}));
+
+test('AI network failure releases the per-key lease so a paused task can resume', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiAttempts: 1, aiRetryDelayMs: 0 });
+    __test.keyManager.updateKeys('synthetic-network-key'); __test.state.stage = 3;
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'network-fixture', QuestionType: 'Blank', DetailHtml: '<p>Network failure fixture</p>',
+      PlatformDetailChecked: true, s2_done: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
+    __fetch = async () => { throw new TypeError('Synthetic transport failure'); };
+    await __test.runStage3();
+    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done };
+    __test.state.isPaused = false; __fetch = async () => __aiResponse('Network recovered');
+    await Promise.race([__test.runStage3(), new Promise((_, reject) => setTimeout(() => reject(new Error('Network failure leaked a lease')), 2000))]);
+    return { failed, row: __test.data[0], paused: __test.state.isPaused };
+  });
+  assert.equal(result.failed.paused, true);
+  assert.notEqual(result.failed.done, true);
+  assert.equal(result.row.SniffedAnswer, 'Network recovered');
+  assert.equal(result.paused, false);
+}));
+
+test('successful AI usage and settings survive ZIP export without credentials or repeated billing', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    const secret = 'synthetic-export-secret-never-persist';
+    __test.keyManager.updateKeys(secret); __test.state.stage = 3;
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'usage', QuestionType: 'Blank', DetailHtml: '<p>Usage fixture</p>', s2_done: true,
+      PlatformDetailChecked: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
+    let calls = 0;
+    __fetch = async () => { calls++; return __aiResponse('Complete synthetic answer', { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18, prompt_cache_hit_tokens: 3, prompt_cache_miss_tokens: 8 }); };
+    await __test.runStage3(); __test.state.stage = 3; await __test.runStage3();
+    await __test.buildZipAndDownload(false);
+    const zip = __zips.at(-1), members = await Promise.all(Object.values(zip.files).filter(file => !file.dir).map(file => file.async('string')));
+    return { calls, row: __test.data[0], report: JSON.parse(await zip.file('extraction-report.json').async('string')),
+      state: JSON.parse(await zip.file('state.json').async('string')), leaked: members.join('').includes(secret) || document.querySelector('#bistu-extractor-panel-log').textContent.includes(secret) };
+  });
+  assert.equal(result.calls, 1);
+  assert.equal(result.leaked, false);
+  assert.equal(result.row.AnswerSource, 'ai');
+  assert.equal(result.row.AIInfo.model, 'deepseek-flash');
+  assert.deepEqual(result.report.aiUsage, { requests: 1, successfulResponses: 1, promptTokens: 11, completionTokens: 7, totalTokens: 18, cacheHitTokens: 3, cacheMissTokens: 8 });
+  assert.deepEqual(result.state.globalState.aiUsage, result.report.aiUsage);
+  assert.equal(result.report.settings.aiConcurrency, 6);
+  assert.deepEqual(result.state.globalState.settings, result.report.settings);
+}));
+
+test('vision uses the stricter 4096-pixel limit at exactly fifteen images and preserves source bytes', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.keyManager.updateKeys('synthetic-boundary-key'); __test.state.stage = 3;
+    const canvas = document.createElement('canvas'); canvas.width = 4600; canvas.height = 2;
+    canvas.getContext('2d').fillRect(0, 0, 4600, 2);
+    const buffer = await (await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))).arrayBuffer();
+    const entries = [], rows = [14, 15].map((count, GlobalUID) => {
+      const urls = Array.from({ length: count }, (_, index) => 'http://fixture.test/boundary-' + GlobalUID + '-' + index + '.png');
+      urls.forEach(url => entries.push([url, { filename: 'img_' + (entries.length + 1) + '.png', buffer, downloaded: true }]));
+      return { GlobalUID, TopicGuid: 'boundary-' + count, QuestionType: 'Blank', DetailHtml: '<p>Boundary ' + count + '</p>', s2_done: true,
+        PlatformDetailChecked: true, s3_done: false, NeedsAI: true, imgUrls: urls };
+    });
+    __test.setImages(entries); __test.setData(rows);
+    const dimensions = [];
+    __fetch = async (_, options) => {
+      const parts = JSON.parse(options.body).messages.find(message => message.role === 'user').content.filter(part => part.type === 'image_url');
+      const image = new Image(); image.src = parts[0].image_url.url; await image.decode();
+      dimensions.push({ count: parts.length, width: image.naturalWidth }); return __aiResponse();
+    };
+    await __test.runStage3();
+    return { dimensions: dimensions.sort((a,b) => a.count-b.count), complete: __test.data.every(row => row.s3_done),
+      preserved: Array.from(__test.images.values()).every(image => image.buffer === buffer) };
+  });
+  assert.deepEqual(result.dimensions, [{ count: 14, width: 4600 }, { count: 15, width: 4096 }]);
+  assert.equal(result.complete, true); assert.equal(result.preserved, true);
+}));
+
+test('snapshot settings can be restored or retained and failed import rolls back without unhandled errors', () => withPage(async page => {
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.evaluate(() => { window.__importBuilds = 0; __test.setBuilder(async () => { window.__importBuilds++; }); });
+  const state = snapshot(); state.globalState.stage = 5;
+  state.globalState.settings = { ...(await page.evaluate(() => __test.getSettings())), aiConcurrency: 2 };
+  await page.evaluate(() => __setSettings({ aiConcurrency: 4, resumeSettings: 'snapshot' }));
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => __importBuilds === 1 && !document.querySelector('#bistu-import-btn').disabled);
+  assert.equal(await page.evaluate(() => __test.getSettings().aiConcurrency), 2);
+  await page.evaluate(() => __setSettings({ aiConcurrency: 4, resumeSettings: 'current' }));
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => __importBuilds === 2 && !document.querySelector('#bistu-import-btn').disabled);
+  assert.equal(await page.evaluate(() => __test.getSettings().aiConcurrency), 4);
+  await page.evaluate(() => __setSettings({ resumeSettings: 'snapshot' }));
+  state.globalState.settings.aiConcurrency = 0;
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => document.querySelector('#bistu-extractor-panel-log').textContent.includes('解析 ZIP 异常') && !document.querySelector('#bistu-import-btn').disabled);
+  assert.equal(await page.evaluate(() => __test.getSettings().aiConcurrency), 4);
+  assert.equal(await page.evaluate(() => __importBuilds), 2);
+  await page.evaluate(() => { document.querySelector('#bistu-extractor-panel-log').textContent = ''; __setSettings({ aiConcurrency: '' }); });
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => document.querySelector('#bistu-extractor-panel-log').textContent.includes('解析 ZIP 异常') && !document.querySelector('#bistu-import-btn').disabled);
+  assert.deepEqual(errors, []);
+  assert.equal(await page.locator('#bistu-start-btn').isEnabled(), true);
+}));
+
+test('an AI timeout aborts the request and frees its only lease for resume', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiAttempts: 1, aiTimeoutMs: 1000, aiRetryDelayMs: 0 });
+    __test.keyManager.updateKeys('synthetic-timeout-key'); __test.state.stage = 3;
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'timeout', QuestionType: 'Blank', DetailHtml: '<p>Timeout fixture</p>', s2_done: true,
+      PlatformDetailChecked: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
+    let aborted = false;
+    __fetch = (_, options) => new Promise((resolve, reject) => options.signal.addEventListener('abort', () => { aborted = true; reject(new DOMException('Synthetic timeout', 'AbortError')); }));
+    await __test.runStage3();
+    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done };
+    __test.state.isPaused = false; __fetch = async () => __aiResponse('After timeout');
+    await Promise.race([__test.runStage3(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout leaked its lease')), 2000))]);
+    return { aborted, failed, row: __test.data[0] };
+  });
+  assert.equal(result.aborted, true); assert.equal(result.failed.paused, true);
+  assert.notEqual(result.failed.done, true); assert.equal(result.row.SniffedAnswer, 'After timeout');
+}));
+
+test('all settings lock while the engine runs and unlock after its pause completes', () => withPage(async page => {
+  await page.evaluate(() => {
+    __test.state.stage = 3;
+    __test.setEngineStage(3, async () => { window.__settingsEntered = true; await new Promise(resolve => { window.__releaseSettings = resolve; }); __test.state.isPaused = true; });
+    __test.setBuilder(async () => {});
+    window.__settingsRun = __test.runEngine();
+  });
+  await page.waitForFunction(() => window.__settingsEntered);
+  assert.equal(await page.evaluate(() => [...document.querySelectorAll('#bistu-settings input, #bistu-settings select, #bistu-settings button')].every(input => input.disabled)), true);
+  await page.evaluate(async () => { __releaseSettings(); await __settingsRun; });
+  assert.equal(await page.evaluate(() => [...document.querySelectorAll('#bistu-settings input, #bistu-settings select, #bistu-settings button')].every(input => !input.disabled)), true);
+}));
+
+test('resume replaces the stale paused status immediately before a pending stage responds', () => withPage(async page => {
+  const waiting = await page.evaluate(() => {
+    __test.state.stage = 3; __test.state.isPaused = true;
+    document.querySelector('#bistu-global-status').innerText = '⏸️ 任务已暂停 (支持续传)';
+    __test.setBuilder(async () => { window.__resumeStatusPackaged = true; });
+    __test.setEngineStage(3, async () => {
+      window.__resumeStatusEntered = true;
+      await new Promise(resolve => { window.__releaseResumeStatus = resolve; });
+      __test.state.isPaused = true;
+    });
+    document.querySelector('#bistu-pause-btn').click();
+    return { entered: window.__resumeStatusEntered, paused: __test.state.isPaused, status: document.querySelector('#bistu-global-status').innerText };
+  });
+  assert.equal(waiting.entered, true);
+  assert.equal(waiting.paused, false);
+  assert.match(waiting.status, /AI 大模型作答中/);
+  assert.doesNotMatch(waiting.status, /暂停|挂起/);
+  await page.evaluate(() => __releaseResumeStatus());
+  await page.waitForFunction(() => window.__resumeStatusPackaged && !document.querySelector('#bistu-pause-btn').disabled);
+}));
+// Append to tests/extractor.test.cjs. Uses its existing assert, withPage,
+// uploadSnapshot, and browser harness helpers. All data and responses are synthetic.
+
+test('default six-way list reads preserve page order and stable IDs with seven-row pages', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    document.querySelector('#select_QuestionType').innerHTML = '<option value="1">单选题</option>';
+    __test.initializePlatformVariables();
+    __test.state.isPaused = false;
+    __setSettings({ pageSize: 7, platformDelayMs: 0, platformAttempts: 1 });
+    const configuredConcurrency = Number(document.querySelector('#bistu-setting-listConcurrency').value);
+    let active = 0, maximum = 0;
+    const completed = [], requestedSizes = [];
+    __respond = async ({ url, data }) => {
+      if (!url.includes('GetTopicData')) throw new Error('Unexpected non-list request');
+      const pageIndex = Number(data.pageIndex), pageSize = Number(data.pageSize);
+      requestedSizes.push(pageSize);
+      active++; maximum = Math.max(maximum, active);
+      try {
+        // Page 7 finishes before page 2, but GlobalUID must follow page order.
+        await new Promise(resolve => setTimeout(resolve, pageIndex === 1 ? 0 : Math.max(1, 8 - pageIndex) * 5));
+        const start = (pageIndex - 1) * pageSize;
+        completed.push(pageIndex);
+        return { Total: 51, DataList: Array.from({ length: Math.max(0, Math.min(pageSize, 51 - start)) }, (_, offset) => ({
+          QuestionType: 'Single', TopicGuid: 'parallel-fixture-' + (start + offset), Title: 'Synthetic parallel fixture'
+        })) };
+      } finally { active--; }
+    };
+    await __test.runStage1();
+    return { configuredConcurrency, maximum, completed, requestedSizes,
+      rows: __test.data.map(row => ({ id: row.GlobalUID, guid: row.TopicGuid })),
+      stage: __test.state.stage, pageSize: __test.state.listProgress.pageSize, expected: __test.state.sourceTotals.Single };
+  });
+  assert.equal(result.configuredConcurrency, 6);
+  assert.equal(result.maximum, 6);
+  assert.ok(result.completed.indexOf(7) < result.completed.indexOf(2));
+  assert.deepEqual(new Set(result.requestedSizes), new Set([7]));
+  assert.equal(result.rows.length, 51);
+  assert.deepEqual(result.rows, Array.from({ length: 51 }, (_, id) => ({ id, guid: 'parallel-fixture-' + id })));
+  assert.equal(result.stage, 2);
+  assert.equal(result.pageSize, 7);
+  assert.equal(result.expected, 51);
+}));
+
+test('a failed parallel page saves a contiguous seven-row cursor and ZIP import ignores a changed page-size control', () => withPage(async page => {
+  const interrupted = await page.evaluate(async () => {
+    document.querySelector('#select_QuestionType').innerHTML = '<option value="1">单选题</option>';
+    __test.initializePlatformVariables();
+    __test.state.isPaused = false;
+    __setSettings({ pageSize: 7, platformDelayMs: 0, platformAttempts: 1 });
+    window.__failThirdPage = true;
+    __respond = async ({ url, data }) => {
+      if (!url.includes('GetTopicData')) throw new Error('Unexpected non-list request');
+      const pageIndex = Number(data.pageIndex), pageSize = Number(data.pageSize);
+      await new Promise(resolve => setTimeout(resolve, pageIndex === 3 ? 15 : 1));
+      if (window.__failThirdPage && pageIndex === 3) throw new Error('Synthetic page gap');
+      const start = (pageIndex - 1) * pageSize;
+      return { Total: 35, DataList: Array.from({ length: Math.max(0, Math.min(pageSize, 35 - start)) }, (_, offset) => ({
+        QuestionType: 'Single', TopicGuid: 'resume-seven-' + (start + offset), Title: 'Synthetic resume fixture'
+      })) };
+    };
+    await __test.runEngine();
+    return { snapshot: JSON.parse(await __zips.at(-1).file('state.json').async('string')),
+      report: JSON.parse(await __zips.at(-1).file('extraction-report.json').async('string')) };
+  });
+  assert.equal(interrupted.report.complete, false);
+  assert.equal(interrupted.snapshot.globalState.isPaused, true);
+  assert.equal(interrupted.snapshot.globalState.stage, 1);
+  assert.equal(interrupted.snapshot.globalState.listProgress.pageSize, 7);
+  assert.equal(interrupted.snapshot.globalState.listProgress.pageIndex, 3);
+  assert.equal(interrupted.snapshot.allData.length, 14);
+  await page.evaluate(() => {
+    window.__failThirdPage = false;
+    window.__resumeCallOffset = __ajaxCalls.length;
+    const originalStage1 = __test.runStage1;
+    // Import restores its saved settings before starting the engine. Change the
+    // control after that restoration to exercise the immutable paging cursor.
+    __test.setEngineStage(1, async () => {
+      __setSettings({ pageSize: 10 });
+      await originalStage1();
+    });
+    __test.setEngineStage(2, async () => { window.__resumedListComplete = true; __test.state.isPaused = true; });
+  });
+  await uploadSnapshot(page, interrupted.snapshot);
+  await page.waitForFunction(() => window.__resumedListComplete && __zips.length >= 2 && !document.querySelector('#bistu-import-btn').disabled);
+  const resumed = await page.evaluate(() => ({
+    pageSize: __test.state.listProgress.pageSize,
+    controlPageSize: Number(document.querySelector('#bistu-setting-pageSize').value),
+    calls: __ajaxCalls.slice(__resumeCallOffset).map(call => ({ page: Number(call.data.pageIndex), size: Number(call.data.pageSize) })),
+    rows: __test.data.map(row => ({ id: row.GlobalUID, guid: row.TopicGuid }))
+  }));
+  assert.equal(resumed.controlPageSize, 10);
+  assert.equal(resumed.pageSize, 7);
+  assert.deepEqual(resumed.calls.map(call => call.page), [3, 4, 5]);
+  assert.ok(resumed.calls.every(call => call.size === 7));
+  assert.deepEqual(resumed.rows, Array.from({ length: 35 }, (_, id) => ({ id, guid: 'resume-seven-' + id })));
+}));
+
+test('subjective questions inspect official details before AI and unresolved official answers never reach the API', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __setSettings({ platformDelayMs: 0, aiRequestIntervalMs: 0, aiAttempts: 1, perKeyConcurrency: 6 });
+    __test.keyManager.updateKeys('synthetic-key-never-sent-to-network');
+    __test.state.stage = 2;
+    __test.setData([
+      { QuestionType: 'Blank', Answer: [], Title: 'Synthetic blank prompt', Requirement: '<p>Preserve blank requirement</p>' },
+      { QuestionType: 'Program', Answer: [], Title: 'Synthetic program prompt', Requirement: '<pre>Preserve program requirement: x &lt; 2</pre>' },
+      { QuestionType: 'Blank', Answer: { opaque: 'Do not guess this field' }, Title: 'Synthetic unresolved prompt' },
+      { QuestionType: 'Program', PlainExample: 'class OfficialFixture {}', Title: 'Synthetic official program', SniffedAnswer: 'old synthetic AI', IsAIAnswer: true, AnswerSource: 'ai', s3_done: true },
+      { QuestionType: 'Single', Answer: ['A'], Title: 'Synthetic direct choice' }
+    ].map((row, GlobalUID) => ({ ...row, GlobalUID, TopicGuid: 'subjective-fixture-' + GlobalUID, imgUrls: [], s2_done: false })));
+    const aiCalls = [];
+    __fetch = async (url, options) => {
+      if (!String(url).includes('api.deepseek.com/chat/completions')) throw new Error('Unexpected external resource request');
+      aiCalls.push(JSON.parse(options.body));
+      return Response.json({ id: 'synthetic-response', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Synthetic completed answer' } }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } });
+    };
+    __respond = ({ url }) => {
+      if (!url.includes('JumpToPracticeTopic')) throw new Error('Known platform answers must not submit guesses');
+      const guid = new URL(url).searchParams.get('Guid');
+      const index = Number(guid.slice('subjective-fixture-'.length));
+      const row = __test.data[index];
+      if (index === 3) throw new Error('PlainExample must not require an extra detail request');
+      const controls = row.QuestionType === 'Blank'
+        ? '<input type="text" name="UserSelect" value="synthetic-input-draft"><textarea name="UserSelect">synthetic-textarea-draft</textarea><select><option>synthetic-select-draft</option></select>'
+        : row.QuestionType === 'Single' ? '<label><input type="radio" value="A">Official choice A</label><label><input type="radio" value="B">Choice B</label>' : '';
+      const image = index === 2 ? '<img src="/synthetic/unresolved-picture.png" alt="Synthetic diagram">' : '';
+      // The live platform can label Blank pages as multiple-choice practice.
+      return `<html><head><title>多选题练习</title></head><body><div class="panel"><div class="panel-heading">多选题练习</div><div class="panel-body">${row.Title}${image}</div><ul class="list-group">${controls}</ul><input id="hidden_TopicGuid" value="${guid}"></div></body></html>`;
+    };
+    await __test.runStage2();
+    const beforeAI = __test.data.map(row => ({ ...row }));
+    const detailCalls = __ajaxCalls.map(call => ({ method: call.method, guid: new URL(call.url).searchParams.get('Guid') }));
+    await __test.runStage3();
+    const offline = new DOMParser().parseFromString(__test.generateOfflineHtml(true), 'text/html');
+    const blankDetail = offline.querySelector('.detail-box');
+    return { beforeAI, afterAI: __test.data, detailCalls, aiCalls, images: Array.from(__test.images.keys()), stage: __test.state.stage, paused: __test.state.isPaused,
+      offlineBlankText: blankDetail.textContent, offlineBlankControls: blankDetail.querySelectorAll('input,textarea,select').length };
+  });
+  assert.equal(result.paused, false);
+  assert.equal(result.stage, 4);
+  assert.deepEqual(result.detailCalls.map(call => call.guid).sort(), ['subjective-fixture-0', 'subjective-fixture-1', 'subjective-fixture-2', 'subjective-fixture-4']);
+  assert.ok(result.detailCalls.every(call => call.method === 'get'));
+  assert.equal(result.beforeAI[0].PlatformDetailChecked, true);
+  assert.equal(result.beforeAI[0].BlankCount, 2);
+  assert.equal((result.offlineBlankText.match(/________/g) || []).length, 2);
+  assert.equal(result.offlineBlankControls, 0);
+  assert.doesNotMatch(result.offlineBlankText, /synthetic-(input|textarea)-draft/);
+  assert.match(result.beforeAI[0].DetailHtml, /Synthetic blank prompt/);
+  assert.match(result.beforeAI[0].DetailHtml, /Preserve blank requirement/);
+  assert.equal(result.beforeAI[1].PlatformDetailChecked, true);
+  assert.match(result.beforeAI[1].DetailHtml, /Preserve program requirement/);
+  assert.equal(result.beforeAI[2].PlatformAnswerUnresolved, true);
+  assert.equal(result.beforeAI[2].NeedsAI, false);
+  assert.match(result.beforeAI[2].ExtractionWarning, /无法明确解析/);
+  assert.match(result.beforeAI[2].DetailHtml, /data-original="http:\/\/fixture\.test\/synthetic\/unresolved-picture\.png"/);
+  assert.deepEqual(result.images, ['http://fixture.test/synthetic/unresolved-picture.png']);
+  assert.equal(result.beforeAI[3].SniffedAnswer, 'class OfficialFixture {}');
+  assert.equal(result.beforeAI[3].AnswerSource, 'platform-reference');
+  assert.equal(result.beforeAI[3].IsAIAnswer, false);
+  assert.equal(result.beforeAI[4].AnswerSource, 'platform-answer');
+  assert.match(result.beforeAI[4].SniffedAnswer, /Official choice A/);
+  assert.equal(result.aiCalls.length, 2);
+  const prompts = result.aiCalls.map(call => JSON.stringify(call.messages));
+  assert.ok(prompts.every(text => !/synthetic-(input|textarea|select)-draft/.test(text)));
+  assert.ok(prompts.some(text => text.includes('Synthetic blank prompt')));
+  assert.ok(prompts.some(text => text.includes('Synthetic program prompt')));
+  assert.ok(prompts.every(text => !text.includes('Synthetic unresolved prompt') && !text.includes('Synthetic official program') && !text.includes('Synthetic direct choice')));
+  assert.equal(result.afterAI[0].IsAIAnswer, true);
+  assert.equal(result.afterAI[1].IsAIAnswer, true);
+  assert.equal(result.afterAI[2].PlatformAnswerUnresolved, true);
+  assert.notEqual(result.afterAI[2].IsAIAnswer, true);
+  assert.equal(result.afterAI[3].AnswerSource, 'platform-reference');
+  assert.equal(result.afterAI[4].AnswerSource, 'platform-answer');
 }));
