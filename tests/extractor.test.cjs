@@ -369,6 +369,8 @@ test('unpacked file:// export loads local images and works in a narrow viewport 
     if (await page.locator('#filterDetails').count() && await page.locator('#filterDetails').getAttribute('open') === null) await page.locator('#filterDetails > summary').click();
     await page.locator('#chapterFilter').selectOption({ label: 'Second chapter' });
     await page.waitForFunction(() => document.getElementById('visibleCount').textContent === '1');
+    await page.locator('.topic:not(.hidden)').scrollIntoViewIfNeeded();
+    await page.waitForFunction(() => document.querySelector('.topic:not(.hidden)').innerText.includes('Beta local fixture'));
     assert.match(await page.locator('.topic:not(.hidden)').innerText(), /Beta local fixture/);
     assert.equal(await page.locator('.code-box').textContent(), 'String s = "&lt;literal&gt; &amp;";\nif (x < 2 && x > 0) {}');
     const layout = await page.evaluate(() => ({ panelBottom: document.getElementById('control-panel').getBoundingClientRect().bottom, firstQuestion: document.querySelector('.topic:not(.hidden)').getBoundingClientRect().top, width: document.documentElement.scrollWidth, viewport: innerWidth }));
@@ -1132,16 +1134,38 @@ test('cached study filtering retains DOM and answer state across 779 questions',
   assert.equal(await page.locator('.topic').count(), 779);
 }));
 
-test('study layout supports mobile and desktop filters, both themes and no horizontal overflow', () => withPage(async page => {
+test('study search stays above left-side filters and outside mobile disclosure without overlapping questions', () => withPage(async page => {
   await renderStudyFixture(page);
-  for (const width of [390, 768, 1440]) {
+  for (const width of [390, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
     if (width !== 768) await page.waitForFunction(wide => document.querySelector('#filterDetails').open === wide, width > 900);
-    const layout = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth, panelBottom: document.querySelector('#control-panel').getBoundingClientRect().bottom, firstQuestion: document.querySelector('.topic').getBoundingClientRect().top }));
+    if (width <= 900 && await page.locator('#filterDetails').evaluate(details => details.open)) await page.locator('#filterDetails summary').click();
+    const layout = await page.evaluate(() => {
+      const sidebar = document.querySelector('.sidebar'), search = document.querySelector('#control-panel');
+      const details = document.querySelector('#filterDetails'), workspace = document.querySelector('.workspace');
+      const searchRect = search.getBoundingClientRect(), workspaceRect = workspace.getBoundingClientRect();
+      return { width: innerWidth, scroll: document.documentElement.scrollWidth,
+        searchFirst: sidebar.firstElementChild === search, outsideDisclosure: !search.closest('details'),
+        searchBottom: searchRect.bottom, searchRight: searchRect.right, filterTop: details.getBoundingClientRect().top,
+        workspaceLeft: workspaceRect.left, firstQuestion: document.querySelector('.topic').getBoundingClientRect().top,
+        positions: [sidebar, search, details].map(element => getComputedStyle(element).position) };
+    });
     assert.ok(layout.scroll <= width, JSON.stringify(layout));
-    assert.ok(layout.firstQuestion > layout.panelBottom, JSON.stringify(layout));
+    assert.equal(layout.searchFirst, true);
+    assert.equal(layout.outsideDisclosure, true);
+    assert.ok(layout.searchBottom <= layout.filterTop, JSON.stringify(layout));
+    assert.ok(layout.positions.every(position => !['sticky', 'fixed'].includes(position)), JSON.stringify(layout));
+    if (width > 900) assert.ok(layout.searchRight <= layout.workspaceLeft, JSON.stringify(layout));
+    else assert.ok(layout.firstQuestion > layout.searchBottom, JSON.stringify(layout));
     if (width <= 900) {
-      if (!(await page.locator('#filterDetails').evaluate(details => details.open))) await page.locator('#filterDetails summary').click();
+      assert.equal(await page.locator('#keywordFilter').isVisible(), true);
+      assert.equal(await page.locator('#searchScope').isVisible(), true);
+      assert.equal(await page.locator('#searchMatch').isVisible(), true);
+      assert.equal(await page.locator('#sourceFilter').isVisible(), false);
+      await studyQuery(page, 'alpha beta', 1);
+      await page.locator('#clearSearch').click();
+      assert.equal(await page.locator('#visibleCount').textContent(), '6');
+      await page.locator('#filterDetails summary').click();
       assert.equal(await page.locator('#chapterFilter').isVisible(), true);
       await page.locator('#chapterFilter').selectOption('数组');
       assert.equal(await page.locator('#visibleCount').textContent(), '2');
@@ -1379,4 +1403,143 @@ test('full search includes original source badges and question numbers while phr
   assert.equal(await page.locator('#searchScope').inputValue(), 'full');
   assert.equal(await page.locator('#keywordFilter').inputValue(), '');
   assert.equal(await page.locator('#visibleCount').textContent(), '3');
+}));
+
+test('sidebar scrolls with the document and search shortcuts return from deep questions on desktop and mobile', () => withPage(async page => {
+  const data = Array.from({ length: 60 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Single', ChapterName: 'Synthetic scroll chapter', DegreeLevel: '简单', DetailHtml: '<p>Synthetic long question.</p>'.repeat(5), SniffedAnswer: 'Synthetic answer' }));
+  await renderStudyFixture(page, data);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const shortcut of ['Control+k', '/']) {
+      await page.evaluate(() => { document.activeElement.blur(); window.scrollTo({ top: 2400, behavior: 'instant' }); });
+      await page.waitForFunction(() => scrollY > 1000);
+      const before = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('#control-panel').getBoundingClientRect().top }));
+      await page.evaluate(() => window.scrollBy({ top: 350, behavior: 'instant' }));
+      const after = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('#control-panel').getBoundingClientRect().top }));
+      assert.ok(before.top < 0 && after.top < before.top, JSON.stringify({ width, before, after }));
+      assert.ok(Math.abs((before.top - after.top) - (after.y - before.y)) < 2, JSON.stringify({ width, before, after }));
+      await page.keyboard.press(shortcut);
+      await page.waitForFunction(() => {
+        const search = document.querySelector('#keywordFilter'), rect = search.getBoundingClientRect();
+        return document.activeElement === search && rect.top >= 0 && rect.bottom <= innerHeight;
+      });
+      assert.equal(await page.locator('#keywordFilter').isVisible(), true);
+      assert.equal(await page.locator('.topic').count(), 60);
+    }
+  }
+}));
+
+test('browser find reaches offscreen topic text and the reader does not intercept Ctrl F', () => withPage(async page => {
+  const token = 'SyntheticBrowserFindLastTopicToken';
+  const data = Array.from({ length: 60 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Blank', ChapterName: 'Synthetic find chapter', DetailHtml: `<p>${GlobalUID === 59 ? token : 'Ordinary synthetic question'}</p>` }));
+  await renderStudyFixture(page, data);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => { window.scrollTo({ top: 0, behavior: 'instant' }); getSelection().removeAllRanges(); });
+  const result = await page.evaluate(value => {
+    const event = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    document.dispatchEvent(event);
+    const found = window.find(value, false, false, true);
+    const selection = getSelection();
+    return { intercepted: event.defaultPrevented, found, text: selection.toString(), count: document.querySelectorAll('.topic').length };
+  }, token);
+  assert.equal(result.intercepted, false);
+  assert.equal(result.found, true);
+  assert.equal(result.text, token);
+  assert.equal(result.count, 60);
+  await page.waitForFunction(() => {
+    const selection = getSelection();
+    if (!selection.rangeCount) return false;
+    const rect = selection.getRangeAt(0).getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < innerHeight;
+  });
+}));
+
+test('print keeps every question and complete code while removing sidebar controls and offscreen rendering containment', () => withPage(async page => {
+  const data = Array.from({ length: 40 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Program', ChapterName: 'Synthetic print chapter', DetailHtml: `<p>Print question ${GlobalUID + 1}</p>`, SniffedAnswer: `class Fixture${GlobalUID} {\n    String value = "print";\n}\n`, AnswerSource: 'platform-reference' }));
+  await renderStudyFixture(page, data);
+  await page.emulateMedia({ media: 'print' });
+  const printed = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector('.sidebar')).display,
+    topics: Array.from(document.querySelectorAll('.topic')).map(topic => {
+      const style = getComputedStyle(topic), code = topic.querySelector('.code-box');
+      return { display: style.display, contentVisibility: style.contentVisibility, code: code.textContent,
+        maxHeight: getComputedStyle(code).maxHeight, overflow: getComputedStyle(code).overflowY };
+    })
+  }));
+  assert.equal(printed.sidebar, 'none');
+  assert.equal(printed.topics.length, data.length);
+  for (const [index, topic] of printed.topics.entries()) {
+    assert.notEqual(topic.display, 'none');
+    assert.equal(topic.contentVisibility, 'visible');
+    assert.equal(topic.code, data[index].SniffedAnswer);
+    assert.equal(topic.maxHeight, 'none');
+    assert.equal(topic.overflow, 'visible');
+  }
+}));
+
+test('filtered questions occupy no height, cannot receive focus or browser find, and fully return after clearing search', () => withPage(async page => {
+  const hiddenToken = 'SyntheticHiddenTopicFindToken';
+  await renderStudyFixture(page, [
+    { GlobalUID: 0, QuestionType: 'Program', ChapterName: 'Programming', DetailHtml: `<p>${hiddenToken}</p>`, SniffedAnswer: 'class SyntheticFocusFixture {}', AnswerSource: 'platform-reference' },
+    { GlobalUID: 1, QuestionType: 'Single', ChapterName: 'Synthetic chapter', DetailHtml: '<p>KeepOnlyFixtureToken</p>', SniffedAnswer: 'Synthetic visible answer' }
+  ]);
+  await page.evaluate(() => { window.__retainedCard = document.querySelector('.topic'); });
+  await studyQuery(page, 'KeepOnlyFixtureToken', 1);
+  const hidden = await page.evaluate(token => {
+    const card = window.__retainedCard, code = card.querySelector('.code-box');
+    const style = getComputedStyle(card);
+    code.focus();
+    getSelection().removeAllRanges();
+    return { height: card.getBoundingClientRect().height, margins: style.display === 'none' ? 0 : parseFloat(style.marginTop) + parseFloat(style.marginBottom),
+      ariaHidden: card.getAttribute('aria-hidden'), focusInside: card.contains(document.activeElement),
+      browserFound: window.find(token, false, false, true), count: document.querySelectorAll('.topic').length };
+  }, hiddenToken);
+  assert.equal(hidden.height, 0);
+  assert.equal(hidden.margins, 0);
+  assert.equal(hidden.ariaHidden, 'true');
+  assert.equal(hidden.focusInside, false);
+  assert.equal(hidden.browserFound, false);
+  assert.equal(hidden.count, 2);
+  assert.equal(await page.locator('.topic.hidden .detail-box').isVisible(), false);
+  await page.locator('#clearSearch').click();
+  const restored = await page.evaluate(token => {
+    const card = document.querySelector('.topic'), code = card.querySelector('.code-box');
+    code.focus();
+    getSelection().removeAllRanges();
+    return { same: card === window.__retainedCard, height: card.getBoundingClientRect().height,
+      ariaHidden: card.getAttribute('aria-hidden'), focused: document.activeElement === code,
+      text: card.innerText, browserFound: window.find(token, false, false, true), count: document.querySelectorAll('.topic').length };
+  }, hiddenToken);
+  assert.equal(restored.same, true);
+  assert.ok(restored.height > 0);
+  assert.equal(restored.ariaHidden, 'false');
+  assert.equal(restored.focused, true);
+  assert.match(restored.text, /SyntheticHiddenTopicFindToken/);
+  assert.equal(restored.browserFound, true);
+  assert.equal(restored.count, 2);
+  assert.equal(await page.locator('.topic.hidden').count(), 0);
+  assert.equal(await page.locator('#visibleCount').textContent(), '2');
+}));
+
+test('narrow-screen prompt and answer images retain natural proportions despite platform inline heights', () => withPage(async page => {
+  const src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=';
+  const markup = `<img src="${src}" style="width:900px;height:100px" width="900" height="100" alt="Synthetic square fixture">`;
+  await renderStudyFixture(page, [{ GlobalUID: 0, QuestionType: 'Single', ChapterName: 'Synthetic image chapter', DetailHtml: `<p>Question image</p>${markup}`, SniffedAnswer: markup }]);
+  await page.waitForFunction(() => Array.from(document.querySelectorAll('.detail-box img,.answer-content img')).every(img => img.complete && img.naturalWidth === 1));
+  for (const width of [390, 768]) {
+    await page.setViewportSize({ width, height: 900 });
+    const images = await page.locator('.detail-box img,.answer-content img').evaluateAll(nodes => nodes.map(img => {
+      const rect = img.getBoundingClientRect();
+      return { width: rect.width, height: rect.height, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight,
+        parentWidth: img.parentElement.getBoundingClientRect().width, src: img.getAttribute('src') };
+    }));
+    assert.equal(images.length, 2);
+    for (const image of images) {
+      assert.equal(image.src, src);
+      assert.ok(image.width > 0 && image.height > 0);
+      assert.ok(image.width <= image.parentWidth + 1 && image.width <= width, JSON.stringify(image));
+      assert.ok(Math.abs(image.width / image.height - image.naturalWidth / image.naturalHeight) < 0.01, JSON.stringify(image));
+    }
+  }
 }));
