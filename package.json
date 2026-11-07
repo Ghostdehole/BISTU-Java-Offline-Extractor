@@ -1,0 +1,15 @@
+{
+  "name": "bistu-java-offline-extractor",
+  "version": "7.10.0",
+  "private": true,
+  "description": "Isolated browser regression tests for the BISTU userscript",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "test": "node --test tests/extractor.test.cjs"
+  },
+  "devDependencies": {
+    "jszip": "3.10.1",
+    "playwright": "1.62.1"
+  },
+  "engines": { "node": ">=20" }
+}
