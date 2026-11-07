@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.10.0
+// @version      7.10.1
 // @description  练习题干、选项与图片离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
+// @match        https://10.148.168.66/Manage/Practice/index*
 // @grant        none
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    const SCRIPT_VERSION = '7.10.1'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -41,7 +44,7 @@
     // 1. 全局状态机与核心变量
     // ==========================================
     let globalState = {
-        version: "7.10.0",
+        version: SCRIPT_VERSION,
         stage: 1,
         isPaused: true,
         outOfKeys: false,
@@ -304,11 +307,15 @@
 
     function updateGlobalProgress() {
         let percent = 0; let status = "处理中";
-        if (globalState.stage === 1) { percent = (globalState.listProgress.typeIndex / PLATFORM_CONFIG.TYPES.length) * 5; status = "📡 扫描题库中..."; }
+        if (globalState.stage === 1) { percent = (globalState.listProgress.typeIndex / (globalState.scope?.typeDefinitions?.length || PLATFORM_CONFIG.TYPES.length)) * 5; status = "📡 扫描题库中..."; }
         else if (globalState.stage === 2) { let done = allData.filter(i => i.s2_done).length; percent = 5 + (allData.length > 0 ? (done / allData.length) * 45 : 0); status = "🔓 深度破解 & 提取图中..."; }
         else if (globalState.stage === 3) { let aiItems = allData.filter(i => i.NeedsAI); let done = aiItems.filter(i => i.s3_done).length; percent = 50 + (aiItems.length > 0 ? (done / aiItems.length) * 40 : 40); status = "🧠 AI 大模型作答中..."; }
         else if (globalState.stage === 4) { let imgItems = Array.from(imageQueue.values()); let done = imgItems.filter(i => i.downloaded || i.failed).length; percent = 90 + (imgItems.length > 0 ? (done / imgItems.length) * 10 : 10); status = "🖼️ 并发下载图片中..."; }
-        else if (globalState.stage >= 5) { percent = 100; status = "🎉 任务完成！"; }
+        else if (globalState.stage >= 5) {
+            percent = 100;
+            const warnings = allData.filter(item => item.ExtractionWarning).length;
+            status = `✅ 已提取 ${allData.length} 题${warnings ? `（${warnings} 题含平台内容提示）` : ''}`;
+        }
 
         if (globalState.isPaused) status = globalState.stage > 4 ? "⚠️ ZIP 尚未生成，请重试打包" : "⏸️ 任务已暂停 (支持续传)";
         if (globalState.outOfKeys) status = "🛑 API Key耗尽，已挂起！";
@@ -321,16 +328,74 @@
     const yieldThread = () => new Promise(r => setTimeout(r, 0));
     function getFormattedTime() { let d = new Date(); let pad = n => n.toString().padStart(2, '0'); return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`; }
 
-    function restorePlatformVariables(scope) {
+    function semanticQuestionType(value) {
+        const normalized = String(value || '').trim().toLowerCase().replace(/[\s_\-\/()（）]/g, '');
+        const aliases = {
+            Single: ['single', 'singlechoice', '单选', '单选题', '单项选择题'],
+            Multiple: ['multiple', 'multiplechoice', '多选', '多选题', '多项选择题'],
+            TrueOrFalse: ['trueorfalse', 'truefalse', '判断', '判断题'],
+            Blank: ['blank', 'fillintheblank', 'fillintheblanks', '填空', '填空题'],
+            Program: ['program', 'programming', '程序题', '编程题', '程序设计题']
+        };
+        return Object.keys(aliases).find(type => aliases[type].includes(normalized)) || null;
+    }
+
+    function validateTypeDefinitions(definitions) {
+        if (!Array.isArray(definitions) || !definitions.length || definitions.length > PLATFORM_CONFIG.TYPES.length) {
+            throw new Error('题型配置为空或数量超出支持范围，请检查平台题型菜单。');
+        }
+        const values = new Set(); const semantics = new Set();
+        return definitions.map(definition => {
+            const supported = definition && PLATFORM_CONFIG.TYPES.find(type => type.type === definition.type);
+            const rawId = definition && String(definition.id ?? '').trim();
+            const id = /^\d+$/.test(rawId) ? Number(rawId) : rawId;
+            const validId = typeof id === 'number' ? Number.isSafeInteger(id) && id >= 0 : semanticQuestionType(id) === definition?.type;
+            if (!supported || !validId || values.has(String(id)) || semantics.has(definition.type)) {
+                throw new Error('题型编号无效、重复或存在未支持题型，请检查平台题型菜单。');
+            }
+            values.add(String(id)); semantics.add(definition.type);
+            return { id, name: supported.name, type: supported.type };
+        });
+    }
+
+    function readPlatformTypeDefinitions() {
+        const select = document.querySelector('#select_QuestionType');
+        if (!select || select.tagName !== 'SELECT') throw new Error('未找到平台题型菜单 #select_QuestionType。请进入在线练习页；若平台改版，需要更新适配。');
+        const definitions = [];
+        for (const option of Array.from(select.options)) {
+            const value = option.value.trim();
+            if (!value) continue; // Empty prompt options do not represent a question type.
+            const labelType = semanticQuestionType(option.textContent);
+            const valueType = semanticQuestionType(value);
+            if (!labelType && !valueType) throw new Error(`平台出现未支持题型“${option.textContent.trim()}”（编号 ${value}），已停止以避免遗漏。`);
+            if (labelType && valueType && labelType !== valueType) throw new Error('题型菜单的名称与枚举值不一致，请检查平台适配。');
+            definitions.push({ id: value, type: labelType || valueType });
+        }
+        return validateTypeDefinitions(definitions);
+    }
+
+    function restorePlatformVariables(scope, stage = globalState.stage) {
         if (!scope || scope.origin !== window.location.origin) throw new Error("断点来源与当前平台不一致，不能继续扫描。");
         for (const field of ['language', 'degree', 'chapter', 'knowledge', 'search']) {
             if (typeof scope[field] !== 'string') throw new Error("断点筛选条件无效，请重新开始提取。");
         }
+        const hasStoredTypes = scope.typeDefinitions !== undefined && scope.typeDefinitions !== null;
+        const definitions = hasStoredTypes ? validateTypeDefinitions(scope.typeDefinitions) : readPlatformTypeDefinitions();
+        if (stage === 1) {
+            const currentDefinitions = readPlatformTypeDefinitions();
+            if (!hasStoredTypes && (currentDefinitions.length !== PLATFORM_CONFIG.TYPES.length || currentDefinitions.some((type, index) => type.id !== PLATFORM_CONFIG.TYPES[index].id || type.type !== PLATFORM_CONFIG.TYPES[index].type))) {
+                throw new Error('旧版扫描断点未保存题型编号与顺序，当前菜单已改变。请重新开始提取，避免错过题目。');
+            }
+            const sameTypes = definitions.length === currentDefinitions.length && definitions.every(saved => currentDefinitions.some(current => current.type === saved.type && current.id === saved.id));
+            if (!sameTypes) throw new Error('平台题型或编号已改变，不能沿用扫描断点。请刷新页面并重新开始提取。');
+        }
+        scope.typeDefinitions = definitions;
         currentLang = scope.language; currentDegree = scope.degree; currentChapter = scope.chapter;
         currentKno = scope.knowledge; currentSearch = scope.search; origin = scope.origin;
     }
 
     function initializePlatformVariables() {
+        const typeDefinitions = readPlatformTypeDefinitions();
         const selectedValues = value => Array.isArray(value) ? value.join(',') : String(value || '');
         currentLang = String($(PLATFORM_CONFIG.SELECTORS.LANG).val() || "Java");
         currentDegree = selectedValues($(PLATFORM_CONFIG.SELECTORS.DEGREE).val());
@@ -338,7 +403,8 @@
         currentKno = selectedValues($(PLATFORM_CONFIG.SELECTORS.KNO).val());
         currentSearch = String($(PLATFORM_CONFIG.SELECTORS.SEARCH).val() || '');
         origin = window.location.origin;
-        globalState.scope = { language: currentLang, degree: currentDegree, chapter: currentChapter, knowledge: currentKno, search: currentSearch, origin };
+        globalState.scope = { language: currentLang, degree: currentDegree, chapter: currentChapter, knowledge: currentKno, search: currentSearch, origin, typeDefinitions };
+        globalState.sourceMetadata = { version: SCRIPT_VERSION, origin, path: window.location.pathname, capturedAt: new Date().toISOString() };
         keyManager.updateKeys(apiKeyInput.value.trim());
         if (keyManager.getCount()) addLog(`加载了 ${keyManager.getCount()} 个 API Key。`, "success");
         else addLog("未提供 API Key：保留全部题目，跳过 AI 解答。", "warning");
@@ -551,12 +617,17 @@ STRICT RULES:
                 restoredImages.set(url, { filename: data.filename, downloaded: !!buffer, buffer, failed: false });
                 if (!buffer) restoredState.stage = Math.min(restoredState.stage, 4);
             }
-            restorePlatformVariables(restoredState.scope);
+            restorePlatformVariables(restoredState.scope, restoredState.stage);
             globalState = restoredState; globalState.isPaused = false; globalState.outOfKeys = false;
             globalState.elapsedSeconds = Number.isFinite(globalState.elapsedSeconds) ? globalState.elapsedSeconds : 0;
             allData = stateObj.allData; imgCounter = stateObj.imgCounter;
             imageQueue = restoredImages;
             for (const data of imageQueue.values()) imgCounter = Math.max(imgCounter, Number(data.filename.match(/^img_(\d+)/i)[1]) + 1);
+            allData.forEach(item => {
+                if (item.QuestionType === 'Program' && item.s2_done && typeof item.PlainExample === 'string' && item.PlainExample.trim() && !item.AnswerSource) {
+                    item.s2_done = false; item.s3_done = false;
+                }
+            });
             if (allData.some(item => !item.s2_done)) globalState.stage = Math.min(globalState.stage, 2);
             if (keyManager.getCount() > 0) {
                 let unanswered = allData.filter(item => item.NeedsAI && !item.SniffedAnswer);
@@ -616,12 +687,15 @@ STRICT RULES:
     // ==========================================
 
     async function runStage1() {
+        restorePlatformVariables(globalState.scope, 1);
+        const taskTypes = globalState.scope.typeDefinitions;
+        if (!globalState.sourceTotals || typeof globalState.sourceTotals !== 'object' || Array.isArray(globalState.sourceTotals)) globalState.sourceTotals = {};
         updateUI(1, "请求数据中...", false);
         const progress = globalState.listProgress;
         const seen = new Set(allData.map(item => `${item.QuestionType}:${item.TopicGuid}`));
-        for (; progress.typeIndex < PLATFORM_CONFIG.TYPES.length; progress.typeIndex++) {
+        for (; progress.typeIndex < taskTypes.length; progress.typeIndex++) {
             if (globalState.isPaused) return;
-            const type = PLATFORM_CONFIG.TYPES[progress.typeIndex];
+            const type = taskTypes[progress.typeIndex];
             const getParam = pageIndex => ({ languageType: currentLang, strDegreeLevel: currentDegree, strChapter: currentChapter, strKnowledge: currentKno, questionType: type.id, search: currentSearch, pageIndex, pageSize: 10 });
             while (true) {
                 if (globalState.isPaused) return;
@@ -648,6 +722,7 @@ STRICT RULES:
                     item.GlobalUID = allData.length; item.s2_done = false; item.s3_done = false; item.imgUrls = [];
                     allData.push(item); seen.add(`${item.QuestionType}:${item.TopicGuid}`);
                 }
+                globalState.sourceTotals[type.type] = total;
                 progress.pageIndex = pageIndex + 1;
                 addLog(`[扫描] ${type.name}第 ${pageIndex}/${Math.max(progress.totalPages, 1)} 页，新增 ${response.DataList.length} 题。`, 'scan');
                 updateUI(1, `已拉取: ${allData.length} 题`);
@@ -689,6 +764,19 @@ STRICT RULES:
         return content.innerHTML;
     }
 
+    function isKnownEmptyChoiceQuestion(doc, item) {
+        const typeName = PLATFORM_CONFIG.TYPES.find(type => type.type === item.QuestionType)?.name;
+        const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const title = normalize(parser.parseFromString(String(item.Title || ''), 'text/html').body.textContent);
+        const body = doc.querySelector('.panel-body');
+        const list = doc.querySelector('ul.list-group');
+        const guid = doc.querySelector('#hidden_TopicGuid');
+        return !!(title && body && list && guid && !list.children.length && !normalize(list.textContent) &&
+            normalize(doc.title) === `${typeName}练习` && normalize(doc.querySelector('.panel-heading')?.textContent) === `${typeName}练习` &&
+            normalize(body.textContent) === title && (!guid.value || guid.value.toLowerCase() === String(item.TopicGuid).toLowerCase()) &&
+            !doc.querySelector('input[type="password"]'));
+    }
+
     async function runStage2() {
         const itemsToProcess = allData.filter(item => !item.s2_done);
         if (!itemsToProcess.length) {
@@ -700,18 +788,25 @@ STRICT RULES:
         addLog('[提取] 启动 3 个并发任务；客观题答案验证会向平台提交练习答案。', 'info');
         await runWithConcurrency(itemsToProcess, 3, async (item, _, workerId) => {
             let htmlContent = '';
+            delete item.ExtractionWarning;
             const detailUrl = new URL(PLATFORM_CONFIG.API.GET_DETAIL(item.QuestionType, encodeURIComponent(item.TopicGuid)), origin).href;
             if (item.QuestionType === 'Program' || item.QuestionType === 'Blank') {
                 htmlContent = `<div style="font-size:16px; font-weight:bold;">${item.Title || ''}</div>`;
                 if (item.Requirement) htmlContent += `<div class="requirement-box"><b>要求:</b><br>${item.Requirement}</div>`;
                 if (!item.Title && !item.Requirement) throw new Error(`题目 ${item.GlobalUID} 的题干为空，已停止以便重试。`);
-                item.NeedsAI = true;
+                if (item.QuestionType === 'Program' && typeof item.PlainExample === 'string' && item.PlainExample.trim()) {
+                    item.SniffedAnswer = item.PlainExample;
+                    item.AnswerSource = 'platform-reference';
+                    item.IsAIAnswer = false;
+                    item.NeedsAI = false;
+                } else item.NeedsAI = true;
             } else {
                 const htmlRaw = await fetchSafe(detailUrl, 'get', null, 'html');
                 const doc = parser.parseFromString(htmlRaw || '', 'text/html');
                 const container = doc.querySelector('form') || doc.querySelector('.container') || doc.body;
                 const inputs = Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
-                if (!inputs.length || doc.querySelector('input[type="password"]')) {
+                const placeholder = !inputs.length && isKnownEmptyChoiceQuestion(doc, item);
+                if ((!inputs.length && !placeholder) || doc.querySelector('input[type="password"]')) {
                     throw new Error(`题目 ${item.GlobalUID} 详情缺少选项，可能登录已过期或页面结构改变。`);
                 }
                 const guidInput = container.querySelector('input[name="Guid"]');
@@ -740,14 +835,20 @@ STRICT RULES:
                     if (result.Result) { answer = choices.map(input => optionHtml(input, container)).join(' <b>|</b> '); break; }
                 }
                 item.SniffedAnswer = answer;
-                item.NeedsAI = !answer;
+                item.IsAIAnswer = false;
+                item.AnswerSource = answer ? 'platform-verified' : null;
+                item.NeedsAI = !answer && !placeholder;
+                if (placeholder) {
+                    item.ExtractionWarning = '平台本题未提供选项，已保留原文；无可验证的答案。';
+                    addLog(`[Worker ${workerId}] 题目 ${item.GlobalUID} 在平台上无选项，保留原文并继续。`, 'warning');
+                }
                 container.querySelectorAll('script, button, input[type="hidden"], input[type="button"], input[type="submit"], a.btn').forEach(el => el.remove());
                 htmlContent = container.innerHTML;
             }
             if (globalState.isPaused) return;
             item.imgUrls = [];
             item.DetailHtml = localizeImages(htmlContent, item, detailUrl);
-            if (item.SniffedAnswer && !item.IsAIAnswer) item.SniffedAnswer = localizeImages(item.SniffedAnswer, item, detailUrl);
+            if (item.SniffedAnswer && !item.IsAIAnswer && item.AnswerSource !== 'platform-reference') item.SniffedAnswer = localizeImages(item.SniffedAnswer, item, detailUrl);
             item.s2_done = true;
             updateUI(2, `已处理: ${allData.filter(row => row.s2_done).length} 题`);
             await yieldThread();
@@ -920,6 +1021,28 @@ STRICT RULES:
         return doc.body.innerHTML;
     }
 
+    function generateExtractionReport(isFinal) {
+        const types = globalState.scope?.typeDefinitions || PLATFORM_CONFIG.TYPES;
+        const byType = types.map(type => {
+            const rows = allData.filter(item => item.QuestionType === type.type);
+            const expected = globalState.sourceTotals?.[type.type];
+            return { type: type.type, name: type.name, expected: Number.isInteger(expected) ? expected : null,
+                collected: rows.length, details: rows.filter(item => item.s2_done).length,
+                verifiedAnswers: rows.filter(item => item.SniffedAnswer && !item.IsAIAnswer && item.AnswerSource !== 'platform-reference' && ['Single','Multiple','TrueOrFalse'].includes(item.QuestionType)).length,
+                referencePrograms: rows.filter(item => item.AnswerSource === 'platform-reference' && item.SniffedAnswer).length,
+                aiAnswers: rows.filter(item => item.IsAIAnswer && item.SniffedAnswer).length,
+                platformContentNotices: rows.filter(item => item.ExtractionWarning).length };
+        });
+        const images = Array.from(imageQueue.values());
+        const duplicateIds = allData.length - new Set(allData.map(item => `${item.QuestionType}:${item.TopicGuid}`)).size;
+        return { schemaVersion: 1, exporterVersion: SCRIPT_VERSION, generatedAt: new Date().toISOString(),
+            complete: !!isFinal, source: globalState.sourceMetadata || null, scope: globalState.scope || null,
+            byType, totalQuestions: allData.length, duplicateIds,
+            images: { expected: images.length, included: images.filter(item => item.buffer && item.buffer.byteLength).length,
+                failed: images.filter(item => item.failed).length },
+            notes: ['题型总数来自本次平台列表响应；未知旧断点数量记为 null。', '平台参考程序未执行验证；平台未提供选项的条目保留原文。'] };
+    }
+
     async function buildZipAndDownload(isFinal = false) {
         addLog(isFinal ? "⚙️ 全流程结束，正在封装最终离线网页和二进制图片..." : "⚙️ 正在生成【安全状态快照断点包】...", "warning");
         let zipArch = new JSZip(); let iFolder = zipArch.folder("images");
@@ -927,6 +1050,7 @@ STRICT RULES:
 
         let stateObj = { schemaVersion: 1, globalState: globalState, allData: allData, imgCounter: imgCounter, imageQueueList: Array.from(imageQueue.entries()).map(([url, data]) => [url, { filename: data.filename, downloaded: !!data.buffer, failed: data.failed }]) };
         zipArch.file("state.json", JSON.stringify(stateObj));
+        zipArch.file("extraction-report.json", JSON.stringify(generateExtractionReport(isFinal), null, 2));
 
         let html = generateOfflineHtml(isFinal);
         zipArch.file("index.html", html);
@@ -951,6 +1075,10 @@ STRICT RULES:
     function generateOfflineHtml(isFinal) {
         const chapters = [...new Set(allData.map(item => item.ChapterName || '未分类'))].sort();
         const difficulties = [...new Set(allData.map(item => item.DegreeLevel || '无'))].sort();
+        const warningCount = allData.filter(item => item.ExtractionWarning).length;
+        const referenceCount = allData.filter(item => item.QuestionType === 'Program' && item.AnswerSource === 'platform-reference' && item.SniffedAnswer).length;
+        const validatedCount = allData.filter(item => ['Single', 'Multiple', 'TrueOrFalse'].includes(item.QuestionType) && item.SniffedAnswer && !item.IsAIAnswer && item.AnswerSource !== 'platform-reference').length;
+        const aiCount = allData.filter(item => item.IsAIAnswer && item.SniffedAnswer).length;
         let html = `
         <!DOCTYPE html>
         <html lang="zh-CN">
@@ -979,6 +1107,9 @@ STRICT RULES:
                 .requirement-box { margin-top:10px; padding:12px; background:var(--req-bg); border-left:4px solid var(--req-border); }
                 .answer-box { margin-top:15px; padding:12px; background:var(--ans-bg); color:var(--ans-color); border-radius:4px; font-size:16px; font-weight:bold; transition: 0.3s; border-left: 5px solid var(--ans-border); white-space: pre-wrap; font-family: Consolas, monospace;}
                 .answer-box.ai-answer { background:var(--ai-bg); color:var(--ai-color); border-left-color: var(--ai-border); font-weight:normal; }
+                .answer-box.reference-answer { font-weight:normal; }
+                .extraction-warning { margin-top:15px; padding:12px; border:1px solid #d99000; border-left:5px solid #d99000; border-radius:4px; overflow-wrap:anywhere; }
+                #extraction-summary { margin:0 0 20px; padding:12px; border:1px solid var(--border-color); border-radius:6px; line-height:1.8; overflow-wrap:anywhere; }
                 .ai-badge { display:inline-block; padding:2px 6px; background:#8e24aa; color:#fff; font-size:12px; border-radius:4px; margin-bottom:8px; font-weight:bold;}
                 .code-container { position: relative; margin-top: 10px; }
                 .code-box { width: 100%; min-height: 80px; max-height: 60vh; overflow-y: auto; padding: 15px; background: var(--code-bg); color: var(--code-text); border: 1px solid var(--code-border); border-radius: 6px; font-family: Consolas, "Courier New", monospace; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; box-sizing: border-box; margin: 0; }
@@ -1008,6 +1139,9 @@ STRICT RULES:
                 <span class="stat">显示: <span id="visibleCount" style="color:#087f68; font-size:18px;">${allData.length}</span> / ${allData.length}</span>
                 ${isFinal ? '' : '<span style="color:#ef5350; font-weight:bold; font-size:14px; margin-left:10px;">⚠️ 恢复断点包</span>'}
             </div>
+            <div id="extraction-summary" data-warning-count="${warningCount}" data-platform-reference-count="${referenceCount}" data-validated-answer-count="${validatedCount}" data-ai-answer-count="${aiCount}">
+                全库统计：平台校验的选项答案 ${validatedCount} 条 · 平台参考程序 ${referenceCount} 条（未运行验证） · AI 解答 ${aiCount} 条（需自行核对） · 提取提醒 ${warningCount} 条
+            </div>
             <div id="back-to-top" onclick="window.scrollTo({top:0, behavior:'smooth'})">↑</div>
             <div id="questions-container">
         `;
@@ -1024,8 +1158,11 @@ STRICT RULES:
             if (!displayHtml || displayHtml.length < 10) displayHtml = `<div style='font-size:16px; font-weight:bold;'>${item.Title || "尚未加载详情即被中断"}</div>`;
 
             html += `<div class='detail-box'>${sanitizeOfflineHtml(displayHtml)}</div>`;
+            if (item.ExtractionWarning) html += `<div class='extraction-warning' role='note'>⚠️ ${escapeHtml(item.ExtractionWarning)}</div>`;
 
-            if (item.IsAIAnswer) {
+            if (item.QuestionType === 'Program' && item.AnswerSource === 'platform-reference' && item.SniffedAnswer) {
+                html += `<div class='answer-box reference-answer'><strong>平台返回的参考程序（未运行验证）</strong><div class="code-container"><pre class="code-box">${escapeHtml(item.SniffedAnswer)}</pre><button class="copy-btn" onclick="copyCode(this)">一键复制</button></div></div>`;
+            } else if (item.IsAIAnswer) {
                 html += `<div class='answer-box ai-answer'><span class='ai-badge'>🤖 DeepSeek 联合解析</span>`;
                 if (item.QuestionType === "Program") {
                     let escapedAns = escapeHtml(item.SniffedAnswer || "未能生成 AI 解答。");
@@ -1035,8 +1172,8 @@ STRICT RULES:
                 }
                 html += `</div>`;
             } else {
-                if (item.SniffedAnswer) html += `<div class='answer-box'>🏆 平台标答：<br/><span style="font-weight:normal;">${sanitizeOfflineHtml(item.SniffedAnswer)}</span></div>`;
-                else html += `<div class='answer-box' style='background:#ffebee; color:#c62828; border-color:#c62828;'>⚠️ 未能探测到答案 (该选项需依赖 AI，但未配置 Key 或被中断)</div>`;
+                if (item.SniffedAnswer) html += `<div class='answer-box'>平台校验的选项答案：<br/><span style="font-weight:normal;">${sanitizeOfflineHtml(item.SniffedAnswer)}</span></div>`;
+                else if (!item.ExtractionWarning) html += `<div class='answer-box' style='background:#ffebee; color:#c62828; border-color:#c62828;'>⚠️ 尚无答案（未配置 AI、等待处理或平台未提供）</div>`;
             }
             html += `</div>`;
         });

@@ -143,11 +143,16 @@ test('pause ZIP then final ZIP both retain identical image bytes and extraction 
     __chapters = [{ id: 'synthetic-chapter' }];
     __test.initializePlatformVariables();
     __test.state.stage = 4;
+    __test.state.sourceTotals = { Single: 1, Program: 1 };
+    __test.setData([
+      { GlobalUID: 0, TopicGuid: 'report-single', QuestionType: 'Single', s2_done: true, DetailHtml: '<p>Report fixture</p>', SniffedAnswer: 'A' },
+      { GlobalUID: 1, TopicGuid: 'report-program', QuestionType: 'Program', s2_done: true, DetailHtml: '<p>Report program fixture</p>', SniffedAnswer: 'class Report {}', AnswerSource: 'platform-reference' }
+    ]);
     __test.setImages([['http://fixture.test/picture.png', { filename: 'img_1.png', buffer: new Uint8Array([1, 2, 3, 4]).buffer, downloaded: true, failed: false }]]);
     await __test.buildZipAndDownload(false);
     await __test.buildZipAndDownload(true);
     const zips = [];
-    for (const zip of __zips) zips.push({ files: Object.keys(zip.files), bytes: zip.file('images/img_1.png') ? Array.from(await zip.file('images/img_1.png').async('uint8array')) : null, state: JSON.parse(await zip.file('state.json').async('string')) });
+    for (const zip of __zips) zips.push({ files: Object.keys(zip.files), bytes: zip.file('images/img_1.png') ? Array.from(await zip.file('images/img_1.png').async('uint8array')) : null, state: JSON.parse(await zip.file('state.json').async('string')), report: JSON.parse(await zip.file('extraction-report.json').async('string')) });
     return zips;
   });
   assert.equal(result.length, 2);
@@ -156,7 +161,18 @@ test('pause ZIP then final ZIP both retain identical image bytes and extraction 
     assert.equal(zip.state.globalState.scope.search, 'scope keyword');
     assert.equal(zip.state.globalState.scope.chapter, 'synthetic-chapter');
     assert.equal(zip.state.globalState.scope.degree, '2,3');
+    assert.equal(zip.report.exporterVersion, '7.10.1');
+    assert.equal(zip.report.source.version, '7.10.1');
+    assert.equal(zip.report.totalQuestions, 2);
+    assert.equal(zip.report.duplicateIds, 0);
+    assert.deepEqual(zip.report.images, { expected: 1, included: 1, failed: 0 });
+    assert.equal(zip.report.byType.find(row => row.type === 'Single').expected, 1);
+    assert.equal(zip.report.byType.find(row => row.type === 'Single').verifiedAnswers, 1);
+    assert.equal(zip.report.byType.find(row => row.type === 'Program').referencePrograms, 1);
+    assert.equal(zip.report.byType.find(row => row.type === 'Blank').expected, null);
   }
+  assert.equal(result[0].report.complete, false);
+  assert.equal(result[1].report.complete, true);
 }));
 
 test('offline HTML treats metadata/AI as text and removes executable rich content', () => withPage(async page => {
@@ -399,4 +415,230 @@ test('ZIP generation failure remains visible and can retry packaging at the comp
   assert.equal(result.enabled, true);
   assert.equal(result.packages, 2);
   assert.equal(result.finalPaused, false);
+}));
+
+test('a genuine matching empty-options practice page is retained with a warning and never submits answers', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 2;
+    __test.setData([{ TopicGuid: 'synthetic-placeholder', QuestionType: 'Single', Title: '<p>Synthetic <b>unavailable</b> question</p>', GlobalUID: 0, s2_done: false }]);
+    __respond = () => '<!doctype html><title>单选题练习</title><form><input id="hidden_TopicGuid" type="hidden" value="synthetic-placeholder"><div class="panel"><div class="panel-heading">单选题练习</div><div class="panel-body"> Synthetic unavailable\n question <ul class="list-group"></ul></div></div></form>';
+    await __test.runStage2();
+    return { row: __test.data[0], stage: __test.state.stage, paused: __test.state.isPaused, submissions: __ajaxCalls.filter(call => call.method === 'post').length };
+  });
+  assert.equal(result.stage, 3);
+  assert.equal(result.paused, false);
+  assert.equal(result.row.s2_done, true);
+  assert.equal(result.row.NeedsAI, false);
+  assert.equal(result.row.SniffedAnswer, '');
+  assert.ok(result.row.ExtractionWarning);
+  assert.match(result.row.DetailHtml, /Synthetic unavailable/);
+  assert.equal(result.submissions, 0);
+}));
+
+test('empty-options exceptions still reject mismatched, incomplete and login page structures', () => withPage(async page => {
+  const results = await page.evaluate(async () => {
+    const base = '<!doctype html><title>单选题练习</title><form><input id="hidden_TopicGuid" type="hidden" value="synthetic-placeholder"><div class="panel"><div class="panel-heading">单选题练习</div><div class="panel-body">Synthetic unavailable question<ul class="list-group"></ul></div></div></form>';
+    const variants = [
+      ['wrong document title', base.replace('<title>单选题练习</title>', '<title>Login</title>')],
+      ['wrong panel heading', base.replace('<div class="panel-heading">单选题练习</div>', '<div class="panel-heading">不同页面</div>')],
+      ['wrong question text', base.replace('Synthetic unavailable question', 'Different question')],
+      ['wrong identity', base.replace('value="synthetic-placeholder"', 'value="different-identity"')],
+      ['missing identity', base.replace('id="hidden_TopicGuid"', 'id="unknown"')],
+      ['missing list', base.replace('<ul class="list-group"></ul>', '')],
+      ['nonempty list', base.replace('<ul class="list-group"></ul>', '<ul class="list-group"><li>Unexpected option text</li></ul>')],
+      ['password input', base.replace('</form>', '<input type="password"></form>')],
+      ['empty question title', base.replace('Synthetic unavailable question', '')]
+    ];
+    const results = [];
+    for (const [name, html] of variants) {
+      __test.state.stage = 2;
+      __test.state.isPaused = false;
+      __test.state.lastError = null;
+      __test.setData([{ TopicGuid: 'synthetic-placeholder', QuestionType: 'Single', Title: name === 'empty question title' ? '' : 'Synthetic unavailable question', GlobalUID: 0, s2_done: false }]);
+      __respond = () => html;
+      await __test.runStage2();
+      results.push({ name, paused: __test.state.isPaused, done: __test.data[0].s2_done, warning: !!__test.data[0].ExtractionWarning });
+    }
+    return { results, submissions: __ajaxCalls.filter(call => call.method === 'post').length };
+  });
+  for (const result of results.results) {
+    assert.equal(result.paused, true, result.name);
+    assert.equal(result.done, false, result.name);
+    assert.equal(result.warning, false, result.name);
+  }
+  assert.equal(results.submissions, 0);
+}));
+
+test('Program PlainExample is retained verbatim as an unverified platform reference without AI calls', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    const code = 'class Fixture {\n  String s = "&lt;literal&gt; &amp; <img src=\\"remote.png\\">";\n  boolean less = 1 < 2 && 2 > 1;\n}';
+    __test.state.stage = 2;
+    __test.keyManager.updateKeys('synthetic-test-key');
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'synthetic-program', QuestionType: 'Program', Title: '<p>Program fixture</p>', Requirement: '<p>Keep exact output</p>', PlainExample: code, s2_done: false, s3_done: false }]);
+    await __test.runStage2();
+    await __test.runStage3();
+    return { code, row: __test.data[0], stage: __test.state.stage, requests: __ajaxCalls.length, imageCount: __test.images.size, html: __test.generateOfflineHtml(true) };
+  });
+  assert.equal(result.row.SniffedAnswer, result.code);
+  assert.equal(result.row.AnswerSource, 'platform-reference');
+  assert.equal(result.row.NeedsAI, false);
+  assert.equal(result.row.IsAIAnswer, false);
+  assert.equal(result.row.s2_done, true);
+  assert.equal(result.stage, 4);
+  assert.equal(result.requests, 0);
+  assert.equal(result.imageCount, 0, 'code containing an img tag is text, not a downloadable resource');
+  await page.setContent(result.html);
+  assert.match(await page.locator('.reference-answer').innerText(), /平台返回的参考程序（未运行验证）/);
+  assert.equal(await page.locator('.reference-answer .code-box').textContent(), result.code);
+  assert.equal(await page.locator('.reference-answer img').count(), 0);
+  await page.evaluate(() => { document.execCommand = command => { if (command === 'copy') window.__copiedReference = document.querySelector('textarea').value; return true; }; });
+  await page.locator('.reference-answer .copy-btn').click();
+  assert.equal(await page.evaluate(() => window.__copiedReference), result.code);
+}));
+
+test('offline warnings remain visible when answers are hidden and summary distinguishes answer sources', () => withPage(async page => {
+  const html = await page.evaluate(() => {
+    __test.setData([
+      { GlobalUID: 0, QuestionType: 'Single', DetailHtml: '<p>Unavailable choice fixture</p>', ExtractionWarning: 'Synthetic missing options <img src=x onerror="alert(1)">', NeedsAI: false, SniffedAnswer: '' },
+      { GlobalUID: 1, QuestionType: 'Program', DetailHtml: '<p>Reference program fixture</p>', AnswerSource: 'platform-reference', SniffedAnswer: 'class Fixture {}', IsAIAnswer: false },
+      { GlobalUID: 2, QuestionType: 'Single', DetailHtml: '<p>Validated choice fixture</p>', SniffedAnswer: 'A' },
+      { GlobalUID: 3, QuestionType: 'Blank', DetailHtml: '<p>AI fixture</p>', SniffedAnswer: 'synthetic AI text', IsAIAnswer: true },
+      { GlobalUID: 4, QuestionType: 'Single', DetailHtml: '<p>Second missing choice fixture</p>', ExtractionWarning: 'Synthetic second missing options', NeedsAI: false, SniffedAnswer: '' }
+    ]);
+    return __test.generateOfflineHtml(true);
+  });
+  await page.setContent(html);
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-warning-count'), '2');
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-platform-reference-count'), '1');
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-validated-answer-count'), '1');
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-ai-answer-count'), '1');
+  assert.equal(await page.locator('.extraction-warning').count(), 2);
+  assert.equal(await page.locator('.extraction-warning img').count(), 0);
+  await page.locator('#toggleAnsBtn').click();
+  for (const warning of await page.locator('.extraction-warning').all()) assert.equal(await warning.isVisible(), true);
+  for (const answer of await page.locator('.answer-box').all()) assert.equal(await answer.isVisible(), false);
+}));
+
+test('legacy Program snapshot reprocesses omitted PlainExample while preserving migrated reference answers', () => withPage(async page => {
+  await page.evaluate(() => {
+    __test.setEngineStage(2, async () => { window.__legacyRows = __test.data; window.__legacyStage = __test.state.stage; __test.state.isPaused = true; });
+    __test.setBuilder(async () => { window.__legacyImportFinished = true; });
+  });
+  const state = snapshot();
+  state.globalState.stage = 5;
+  state.globalState.version = '7.10.0';
+  state.allData = [
+    { GlobalUID: 0, TopicGuid: 'legacy-program', QuestionType: 'Program', Title: 'Legacy fixture', DetailHtml: '<p>Legacy fixture</p>', PlainExample: 'class Legacy {}', s2_done: true, s3_done: true, NeedsAI: true },
+    { GlobalUID: 1, TopicGuid: 'migrated-program', QuestionType: 'Program', Title: 'Migrated fixture', DetailHtml: '<p>Migrated fixture</p>', PlainExample: 'class Migrated {}', AnswerSource: 'platform-reference', SniffedAnswer: 'class Migrated {}', s2_done: true, s3_done: true, NeedsAI: false }
+  ];
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => window.__legacyImportFinished);
+  const actual = await page.evaluate(() => ({ stage: __legacyStage, rows: __legacyRows }));
+  assert.equal(actual.stage, 2);
+  assert.equal(actual.rows[0].s2_done, false);
+  assert.equal(actual.rows[0].s3_done, false);
+  assert.equal(actual.rows[1].s2_done, true);
+  assert.equal(actual.rows[1].AnswerSource, 'platform-reference');
+}));
+
+test('platform menu drives reordered numeric IDs, enum IDs and supported type subsets', () => withPage(async page => {
+  const results = await page.evaluate(async () => {
+    const results = [];
+    for (const useEnums of [false, true]) {
+      const programId = useEnums ? 'Program' : '47';
+      const singleId = useEnums ? 'Single' : '12';
+      document.querySelector('#select_QuestionType').innerHTML = `<option value="">请选择</option><option value="${programId}">Programming</option><option value="${singleId}">单项选择题</option>`;
+      __test.initializePlatformVariables();
+      __test.state.stage = 1;
+      __test.state.isPaused = false;
+      __test.state.listProgress = { typeIndex: 0, pageIndex: 1, totalPages: 0 };
+      __test.state.sourceTotals = {};
+      __test.setData([]);
+      const calls = [];
+      __respond = ({ data }) => {
+        calls.push(data.questionType);
+        const type = String(data.questionType) === programId ? 'Program' : 'Single';
+        return { Total: 1, DataList: [{ TopicGuid: `synthetic-${type}`, QuestionType: type, Title: 'Synthetic menu fixture' }] };
+      };
+      await __test.runStage1();
+      results.push({ calls, stage: __test.state.stage, types: __test.data.map(row => row.QuestionType), definitions: __test.state.scope.typeDefinitions, totals: __test.state.sourceTotals });
+    }
+    return results;
+  });
+  assert.deepEqual(results[0].calls, [47, 12]);
+  assert.deepEqual(results[1].calls, ['Program', 'Single']);
+  for (const result of results) {
+    assert.equal(result.stage, 2);
+    assert.deepEqual(result.types, ['Program', 'Single']);
+    assert.deepEqual(result.totals, { Program: 1, Single: 1 });
+    assert.equal(result.definitions.length, 2);
+  }
+}));
+
+test('preflight refuses unknown, duplicate, conflicting, empty and missing platform type menus', () => withPage(async page => {
+  const results = await page.evaluate(() => {
+    const original = document.querySelector('#select_QuestionType').outerHTML;
+    const variants = [
+      ['unknown', '<option value="9">Essay</option>'],
+      ['duplicate ID', '<option value="1">单选题</option><option value="1">填空题</option>'],
+      ['duplicate semantic', '<option value="1">单选题</option><option value="7">Single choice</option>'],
+      ['conflicting enum', '<option value="Single">填空题</option>'],
+      ['empty menu', '<option value="">请选择</option>'],
+      ['missing menu', null]
+    ];
+    return variants.map(([name, markup]) => {
+      document.querySelector('#select_QuestionType')?.remove();
+      document.body.insertAdjacentHTML('afterbegin', original);
+      if (markup === null) document.querySelector('#select_QuestionType').remove();
+      else document.querySelector('#select_QuestionType').innerHTML = markup;
+      let error;
+      try { __test.initializePlatformVariables(); } catch (e) { error = e.message; }
+      return { name, error, requests: __ajaxCalls.length };
+    });
+  });
+  for (const result of results) {
+    assert.ok(result.error, result.name);
+    assert.equal(result.requests, 0, result.name);
+  }
+}));
+
+test('stored type mapping tolerates reordered menus but rejects changed IDs or membership before scanning', () => withPage(async page => {
+  const actual = await page.evaluate(async () => {
+    document.querySelector('#select_QuestionType').innerHTML = '<option value="47">程序题</option><option value="12">单选题</option>';
+    __test.initializePlatformVariables();
+    const scope = JSON.parse(JSON.stringify(__test.state.scope));
+    document.querySelector('#select_QuestionType').innerHTML = '<option value="12">单选题</option><option value="47">程序题</option>';
+    __test.restorePlatformVariables(scope, 1);
+    const preservedOrder = scope.typeDefinitions.map(type => type.id);
+    const failures = [];
+    for (const markup of ['<option value="13">单选题</option><option value="47">程序题</option>', '<option value="12">单选题</option>']) {
+      document.querySelector('#select_QuestionType').innerHTML = markup;
+      __test.state.scope = JSON.parse(JSON.stringify(scope));
+      let error;
+      try { await __test.runStage1(); } catch (e) { error = e.message; }
+      failures.push(error);
+    }
+    return { preservedOrder, failures, requests: __ajaxCalls.length };
+  });
+  assert.deepEqual(actual.preservedOrder, [47, 12]);
+  assert.ok(actual.failures.every(Boolean));
+  assert.equal(actual.requests, 0);
+}));
+
+test('legacy scan without stored type definitions cannot resume after menu order, IDs or membership change', () => withPage(async page => {
+  const actual = await page.evaluate(() => {
+    const legacy = JSON.parse(JSON.stringify(__test.state.scope));
+    delete legacy.typeDefinitions;
+    __test.restorePlatformVariables(JSON.parse(JSON.stringify(legacy)), 1);
+    const options = [
+      '<option value="2">多选题</option><option value="1">单选题</option><option value="3">判断题</option><option value="4">填空题</option><option value="5">程序题</option>',
+      '<option value="11">单选题</option><option value="2">多选题</option><option value="3">判断题</option><option value="4">填空题</option><option value="5">程序题</option>',
+      '<option value="1">单选题</option>'
+    ];
+    return options.map(markup => {
+      document.querySelector('#select_QuestionType').innerHTML = markup;
+      try { __test.restorePlatformVariables(JSON.parse(JSON.stringify(legacy)), 1); return false; } catch (_) { return true; }
+    });
+  });
+  assert.deepEqual(actual, [true, true, true]);
 }));
