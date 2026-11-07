@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { chromium, webkit } = require('playwright');
 
 const sourcePath = path.resolve(__dirname, '..', 'BISTU_Java_Extractor.user.js');
 const jszipPath = require.resolve('jszip/dist/jszip.min.js');
@@ -39,15 +39,16 @@ function instrument(source) {
 ` + source.slice(end);
 }
 
-async function launch() {
-  return chromium.launch({
+async function launch(engine = 'chromium') {
+  if (!['chromium', 'webkit'].includes(engine)) throw new Error('Unsupported test browser engine');
+  return (engine === 'webkit' ? webkit : chromium).launch({
     headless: true,
-    ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {})
+    ...(engine === 'chromium' && process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {})
   });
 }
 
-async function createHarness(browser, sourceOverride, fixtureHtml) {
-  const context = await browser.newContext();
+async function createHarness(browser, sourceOverride, fixtureHtml, contextOptions = {}) {
+  const context = await browser.newContext(contextOptions);
   // Never use a real campus origin, cookies, course data, or an external AI API.
   await context.route('**/*', route => {
     if (route.request().url() === 'http://fixture.test/Manage/Practice/index') {
