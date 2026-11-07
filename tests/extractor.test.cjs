@@ -382,7 +382,7 @@ test('unpacked file:// export loads local images and works in a narrow viewport 
   }
 }));
 
-test('OCR image prefetch rejects a login HTML response instead of storing it as an offline image', () => withPage(async page => {
+test('OCR login HTML skips AI without storing an image, then stage 4 pauses for image recovery', () => withPage(async page => {
   const result = await page.evaluate(async () => {
     __test.state.stage = 3;
     __test.keyManager.updateKeys('synthetic-test-key');
@@ -392,13 +392,19 @@ test('OCR image prefetch rejects a login HTML response instead of storing it as 
     const calls = [];
     window.__fetch = async target => { calls.push(target); return new Response('<html><input type="password"></html>', { status: 200, headers: { 'Content-Type': 'text/html' } }); };
     await __test.runStage3();
-    return { calls, paused: __test.state.isPaused, stage: __test.state.stage, buffer: __test.images.get(url).buffer, answered: __test.data[0].s3_done };
+    const afterAI = { paused: __test.state.isPaused, stage: __test.state.stage, warning: __test.data[0].ExtractionWarning };
+    await __test.runStage4();
+    return { calls, afterAI, paused: __test.state.isPaused, stage: __test.state.stage, buffer: __test.images.get(url).buffer, answered: __test.data[0].s3_done, needsAI: __test.data[0].NeedsAI };
   });
-  assert.deepEqual(result.calls, ['http://fixture.test/picture.png']);
+  assert.deepEqual(result.calls, Array(4).fill('http://fixture.test/picture.png'));
+  assert.equal(result.afterAI.paused, false);
+  assert.equal(result.afterAI.stage, 4);
+  assert.match(result.afterAI.warning, /AI 解答尚未生成/);
   assert.equal(result.paused, true);
-  assert.equal(result.stage, 3);
+  assert.equal(result.stage, 4);
   assert.equal(result.buffer, null);
   assert.equal(result.answered, false);
+  assert.equal(result.needsAI, true);
 }));
 
 test('ZIP generation failure remains visible and can retry packaging at the completed extraction stage', () => withPage(async page => {
@@ -1167,4 +1173,120 @@ test('source-unavailable image placeholders preserve explanations, metadata and 
   await page.locator('#toggleAnsBtn').click();
   assert.equal(await page.locator('.question-image-warning').isVisible(), true);
   assert.equal(await placeholder.isVisible(), true);
+}));
+
+test('AI skips unavailable question images while other answers and stage 4 complete honestly', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 3;
+    __test.keyManager.updateKeys('synthetic-test-key');
+    const url = 'http://fixture.test/missing.png';
+    __test.setData([
+      { GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'picture-fixture', Title: 'Picture fixture', DetailHtml: '<p>Image required</p><img src="images/img_1.png">', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false },
+      { GlobalUID: 1, QuestionType: 'Blank', TopicGuid: 'text-fixture', Title: 'Text fixture', DetailHtml: '<p>Text only fixture</p>', imgUrls: [], NeedsAI: true, s2_done: true, s3_done: false }
+    ]);
+    __test.setImages([[url, { filename: 'img_1.png', downloaded: false, buffer: null, failed: false }]]);
+    const calls = [];
+    __fetch = async (target, options) => {
+      calls.push({ target, body: options?.body });
+      if (target === url) return new Response('', { status: 404 });
+      return Response.json({ choices: [{ message: { content: 'Synthetic text answer' } }] });
+    };
+    await __test.runEngine();
+    return { rows: __test.data, calls, state: __test.state,
+      report: JSON.parse(await __zips[0].file('extraction-report.json').async('string')),
+      html: await __zips[0].file('index.html').async('string') };
+  });
+  assert.equal(result.state.stage, 5);
+  assert.equal(result.state.isPaused, false);
+  assert.equal(result.rows[0].s3_done, false);
+  assert.equal(result.rows[0].NeedsAI, true);
+  assert.equal(result.rows[0].SniffedAnswer, undefined);
+  assert.match(result.rows[0].ExtractionWarning, /AI 解答尚未生成/);
+  assert.equal(result.rows[1].s3_done, true);
+  assert.equal(result.rows[1].SniffedAnswer, 'Synthetic text answer');
+  const aiCalls = result.calls.filter(call => call.target.includes('deepseek.com'));
+  assert.equal(aiCalls.length, 1);
+  assert.match(aiCalls[0].body, /Text only fixture/);
+  assert.doesNotMatch(aiCalls[0].body, /Image required/);
+  assert.equal(result.report.complete, true);
+  assert.equal(result.report.imagesComplete, false);
+  assert.equal(result.report.images.sourceUnavailable, 1);
+  assert.match(result.html, /AI 解答尚未生成/);
+}));
+
+test('reimporting an unanswered missing-image snapshot deduplicates AI warnings and clears only that warning after recovery', () => withPage(async page => {
+  const state = snapshot();
+  state.globalState.stage = 5;
+  state.imgCounter = 2;
+  state.allData = [{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'resume-fixture', Title: 'Resume fixture', DetailHtml: '<p>Image required</p><img src="images/img_1.png">', imgUrls: ['http://fixture.test/missing.png'], NeedsAI: true, s2_done: true, s3_done: false, ExtractionWarning: 'Existing platform warning' }];
+  state.imageQueueList = [['http://fixture.test/missing.png', { filename: 'img_1.png', downloaded: false, failed: false, sourceUnavailable: true, status: 404 }]];
+  await page.evaluate(() => {
+    document.getElementById('bistu-apikey').value = 'synthetic-test-key';
+    window.__aiCalls = 0;
+    __fetch = async target => {
+      if (target.includes('deepseek.com')) { __aiCalls++; return Response.json({ choices: [{ message: { content: 'Synthetic recovered answer' } }] }); }
+      if (!window.__imageRecovered) return new Response('', { status: 404 });
+      const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
+      return new Response(png, { headers: { 'Content-Type': 'image/png' } });
+    };
+  });
+  let restored = state;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await uploadSnapshot(page, restored);
+    await page.waitForFunction(count => __zips.length === count && !document.getElementById('bistu-import-btn').disabled, attempt);
+    restored = await page.evaluate(async () => JSON.parse(await __zips.at(-1).file('state.json').async('string')));
+    assert.equal(restored.globalState.stage, 5);
+    assert.equal(restored.allData[0].s3_done, false);
+    assert.equal(restored.allData[0].NeedsAI, true);
+    assert.equal(restored.allData[0].SniffedAnswer, undefined);
+    assert.equal(restored.allData[0].ExtractionWarning.split('AI 解答尚未生成').length - 1, 1);
+    assert.match(restored.allData[0].ExtractionWarning, /^Existing platform warning\n/);
+    assert.equal(await page.evaluate(() => __aiCalls), 0);
+  }
+  await page.evaluate(() => { window.__imageRecovered = true; });
+  await uploadSnapshot(page, restored);
+  await page.waitForFunction(() => __zips.length === 3 && !document.getElementById('bistu-import-btn').disabled);
+  const recovered = await page.evaluate(async () => ({ row: __test.data[0], calls: __aiCalls, image: __test.images.values().next().value,
+    report: JSON.parse(await __zips.at(-1).file('extraction-report.json').async('string')) }));
+  assert.equal(recovered.row.s3_done, true);
+  assert.equal(recovered.row.SniffedAnswer, 'Synthetic recovered answer');
+  assert.equal(recovered.row.ExtractionWarning, 'Existing platform warning');
+  assert.equal(recovered.calls, 2); // OCR correction and answer, both synthetic.
+  assert.equal(recovered.image.sourceUnavailable, false);
+  assert.equal(recovered.report.complete, true);
+  assert.equal(recovered.report.imagesComplete, true);
+}));
+
+test('OCR errors and empty recognition leave AI unanswered until image text can be read', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.keyManager.updateKeys('synthetic-test-key');
+    const url = 'http://fixture.test/picture.png';
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0)).buffer;
+    __test.setData([{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'ocr-fixture', DetailHtml: '<p>OCR fixture</p>', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false, ExtractionWarning: 'Keep this platform warning' }]);
+    __test.setImages([[url, { filename: 'img_1.png', buffer: png, downloaded: true }]]);
+    let mode = 'throw', calls = 0;
+    Tesseract.createWorker = async () => ({ recognize: async () => {
+      if (mode === 'throw') throw new Error('Synthetic OCR failure');
+      return { data: { text: mode === 'empty' ? '' : 'Synthetic OCR text' } };
+    } });
+    __fetch = async () => { calls++; return Response.json({ choices: [{ message: { content: 'Synthetic answer' } }] }); };
+    const attempts = [];
+    for (mode of ['throw', 'empty', 'valid']) {
+      __test.state.stage = 3; __test.state.isPaused = false;
+      await __test.runStage3();
+      attempts.push({ row: { ...__test.data[0] }, stage: __test.state.stage, paused: __test.state.isPaused, calls });
+    }
+    return attempts;
+  });
+  for (const attempt of result.slice(0, 2)) {
+    assert.equal(attempt.stage, 4);
+    assert.equal(attempt.paused, false);
+    assert.equal(attempt.calls, 0);
+    assert.equal(attempt.row.s3_done, false);
+    assert.equal(attempt.row.SniffedAnswer, undefined);
+    assert.equal(attempt.row.ExtractionWarning.split('AI 解答尚未生成').length - 1, 1);
+  }
+  assert.equal(result[2].row.s3_done, true);
+  assert.equal(result[2].row.ExtractionWarning, 'Keep this platform warning');
+  assert.equal(result[2].calls, 2);
 }));

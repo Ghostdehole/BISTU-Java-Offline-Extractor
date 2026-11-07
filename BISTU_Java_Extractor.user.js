@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.11.0
+// @version      7.11.1
 // @description  练习题干、选项与图片离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.11.0'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.11.1'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -1038,6 +1038,14 @@ STRICT RULES:
             return;
         }
 
+        const imageWarning = 'AI 解答尚未生成：题目图片未能完整读取或识别，已保留原题并跳过 AI。请在图片恢复后重试。';
+        const setImageWarning = (item, pending) => {
+            const warnings = String(item.ExtractionWarning || '').split('\n').filter(line => line !== imageWarning);
+            if (pending) warnings.push(imageWarning);
+            const warning = warnings.filter(Boolean).join('\n');
+            if (warning) item.ExtractionWarning = warning; else delete item.ExtractionWarning;
+        };
+
         if (aiItems.some(item => item.imgUrls && item.imgUrls.length)) await ensureOcrWorker();
         if (globalState.isPaused) return;
         let aiConcurrency = Math.min(Math.max(keyManager.getCount() * 2, 1), 4);
@@ -1046,14 +1054,30 @@ STRICT RULES:
         await runWithConcurrency(aiItems, aiConcurrency, async (item, _, workerId) => {
             let tempDoc = parser.parseFromString(item.DetailHtml || '', 'text/html').body; let pureText = tempDoc.textContent || tempDoc.innerText || "";
             let combinedOcr = "";
+            let imageError = null;
             for (let url of (item.imgUrls || [])) {
                 if (globalState.isPaused) return; let qData = imageQueue.get(url);
-                if (qData && !qData.buffer) qData.buffer = await fetchImageBuffer(url);
-                if (qData && qData.buffer && ocrWorker) {
+                try {
+                    if (!qData) throw new Error('图片记录缺失');
+                    if (!qData.buffer) qData.buffer = await fetchImageBuffer(url);
+                    if (!ocrWorker) throw new Error('OCR 引擎不可用');
                     addLog(`[Worker ${workerId}] OCR 正在剥离图片内容...`, "image");
-                    try { let base64 = "data:image/png;base64," + bufferToBase64(qData.buffer); const ret = await ocrWorker.recognize(base64); if (ret && ret.data && ret.data.text) { let textClean = ret.data.text.trim(); if(textClean) combinedOcr += "\n" + textClean; addLog(`[Worker ${workerId}] OCR 初步识别到: ${textClean.substring(0,30)}...`, "info"); } } catch (e) { addLog(`[Worker ${workerId}] OCR 识别崩溃跳过`, "error"); }
-                }
+                    let base64 = "data:image/png;base64," + bufferToBase64(qData.buffer);
+                    const ret = await ocrWorker.recognize(base64);
+                    const textClean = ret && ret.data && typeof ret.data.text === 'string' ? ret.data.text.trim() : '';
+                    if (!textClean) throw new Error('OCR 未能读取图片内容');
+                    combinedOcr += "\n" + textClean;
+                    addLog(`[Worker ${workerId}] OCR 初步识别到: ${textClean.substring(0,30)}...`, "info");
+                } catch (error) { imageError = error; break; }
             }
+
+            if (imageError) {
+                item.s3_done = false;
+                setImageWarning(item, true);
+                addLog(`[Worker ${workerId}] 题目 ${item.GlobalUID} 的图片无法用于 AI (${imageError.message})，保留未解并继续图片核对。`, 'warning');
+                return;
+            }
+            setImageWarning(item, false);
 
             if (combinedOcr.trim()) { addLog(`[Worker ${workerId}] 🧠 触发 AI 视觉清洗：尝试修正 OCR 中的字符乱码和格式...`, "ai"); let cleanOcr = await correctOcrText(combinedOcr); pureText += `\n\n${cleanOcr}`; }
             if (globalState.isPaused) return; let displayTitle = item.Title ? item.Title.replace(/\n/g,"").substring(0, 15) : "Unknown Topic"; addLog(`[Worker ${workerId}] 🚀 呼叫 DeepSeek: 《${displayTitle}...》 (推导中...)`, "ai");
@@ -1062,7 +1086,12 @@ STRICT RULES:
             updateUI(3, `已解答: ${allData.filter(i => i.NeedsAI && i.s3_done).length} 题`); await yieldThread();
         });
 
-        if (!globalState.isPaused) { updateUI(3, `解答完成`, true); globalState.stage = 4; addLog("==================================", "success"); addLog(`✅ 阶段三完毕：所有待解题目的 AI 辅助推理完成。`, "success"); addLog("==================================", "success"); }
+        if (!globalState.isPaused) {
+            const pending = aiItems.filter(item => !item.s3_done).length;
+            updateUI(3, pending ? `${pending} 题因图片未能解答，详见题目提醒` : '解答完成', true);
+            globalState.stage = 4;
+            addLog(pending ? `阶段三结束：${pending} 题保留未解，继续核对与保存图片。` : '✅ 阶段三完毕：所有待解题目的 AI 辅助推理完成。', pending ? 'warning' : 'success');
+        }
     }
 
     async function runStage4() {
