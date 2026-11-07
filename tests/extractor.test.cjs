@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { before, after, test } = require('node:test');
-const { launch, createHarness } = require('./harness.cjs');
+const { launch, createHarness, sourcePath } = require('./harness.cjs');
 const JSZip = require('jszip');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -1077,6 +1077,9 @@ test('study keyboard shortcuts respect editable input and Chinese composition', 
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#keywordFilter').inputValue(), '');
   assert.equal(await page.locator('#visibleCount').textContent(), '6');
+  await page.locator('.skip-link').focus();
+  await page.keyboard.press('Enter');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'keywordFilter');
   await page.locator('h1').click(); await page.keyboard.press('Control+k');
   assert.equal(await page.evaluate(() => document.activeElement.id), 'keywordFilter');
   await page.locator('#keywordFilter').evaluate(input => {
@@ -1135,33 +1138,47 @@ test('cached study filtering retains DOM and answer state across 779 questions',
   assert.equal(await page.locator('.topic').count(), 779);
 }));
 
-test('study search stays above left-side filters and outside mobile disclosure without overlapping questions', () => withPage(async page => {
+test('study search, result count and global answers stay in the sidebar outside mobile disclosure without overlap', () => withPage(async page => {
   await renderStudyFixture(page);
   for (const width of [390, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
     if (width !== 768) await page.waitForFunction(wide => document.querySelector('#filterDetails').open === wide, width > 900);
     if (width <= 900 && await page.locator('#filterDetails').evaluate(details => details.open)) await page.locator('#filterDetails summary').click();
+    await page.evaluate(() => { window.scrollTo(0, 0); document.querySelector('.sidebar').scrollTop = 0; });
     const layout = await page.evaluate(() => {
       const sidebar = document.querySelector('.sidebar'), search = document.querySelector('#control-panel');
       const details = document.querySelector('#filterDetails'), workspace = document.querySelector('.workspace');
+      const results = document.querySelector('.results-toolbar'), toggle = document.querySelector('#toggleAnsBtn');
       const searchRect = search.getBoundingClientRect(), workspaceRect = workspace.getBoundingClientRect();
       return { width: innerWidth, scroll: document.documentElement.scrollWidth,
         searchFirst: sidebar.firstElementChild === search, outsideDisclosure: !search.closest('details'),
         searchBottom: searchRect.bottom, searchRight: searchRect.right, filterTop: details.getBoundingClientRect().top,
         workspaceLeft: workspaceRect.left, firstQuestion: document.querySelector('.topic').getBoundingClientRect().top,
+        resultInside: sidebar.contains(results) && sidebar.contains(toggle) && sidebar.contains(document.querySelector('#visibleCount')),
+        resultsOutsideDisclosure: !results.closest('details'), resultTop: results.getBoundingClientRect().top, resultBottom: results.getBoundingClientRect().bottom,
+        uniqueControls: ['#resultStatus', '#visibleCount', '#toggleAnsBtn'].every(selector => document.querySelectorAll(selector).length === 1),
+        sidebarBottom: sidebar.getBoundingClientRect().bottom, sidebarHeight: sidebar.clientHeight, sidebarContentHeight: sidebar.scrollHeight,
         positions: [sidebar, search, details].map(element => getComputedStyle(element).position) };
     });
     assert.ok(layout.scroll <= width, JSON.stringify(layout));
     assert.equal(layout.searchFirst, true);
     assert.equal(layout.outsideDisclosure, true);
-    assert.ok(layout.searchBottom <= layout.filterTop, JSON.stringify(layout));
-    assert.ok(layout.positions.every(position => !['sticky', 'fixed'].includes(position)), JSON.stringify(layout));
+    assert.equal(layout.resultInside, true);
+    assert.equal(layout.resultsOutsideDisclosure, true);
+    assert.equal(layout.uniqueControls, true);
+    assert.ok(layout.searchBottom <= layout.resultTop && layout.resultBottom <= layout.filterTop, JSON.stringify(layout));
     if (width > 900) assert.ok(layout.searchRight <= layout.workspaceLeft, JSON.stringify(layout));
-    else assert.ok(layout.firstQuestion > layout.searchBottom, JSON.stringify(layout));
+    else {
+      assert.ok(layout.positions.every(position => !['sticky', 'fixed'].includes(position)), JSON.stringify(layout));
+      assert.ok(layout.firstQuestion >= layout.sidebarBottom, JSON.stringify(layout));
+      assert.ok(layout.sidebarContentHeight <= layout.sidebarHeight + 1, JSON.stringify(layout));
+    }
     if (width <= 900) {
       assert.equal(await page.locator('#keywordFilter').isVisible(), true);
       assert.equal(await page.locator('#searchScope').isVisible(), true);
       assert.equal(await page.locator('#searchMatch').isVisible(), true);
+      assert.equal(await page.locator('#visibleCount').isVisible(), true);
+      assert.equal(await page.locator('#toggleAnsBtn').isVisible(), true);
       assert.equal(await page.locator('#sourceFilter').isVisible(), false);
       await studyQuery(page, 'alpha beta', 1);
       await page.locator('#clearSearch').click();
@@ -1407,20 +1424,26 @@ test('full search includes original source badges and question numbers while phr
   assert.equal(await page.locator('#visibleCount').textContent(), '3');
 }));
 
-test('sidebar scrolls with the document and search shortcuts return from deep questions on desktop and mobile', () => withPage(async page => {
+test('desktop sidebar stays reachable while mobile sidebar scrolls normally and deep search shortcuts work', () => withPage(async page => {
   const data = Array.from({ length: 60 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Single', ChapterName: 'Synthetic scroll chapter', DegreeLevel: '简单', DetailHtml: '<p>Synthetic long question.</p>'.repeat(5), SniffedAnswer: 'Synthetic answer' }));
   await renderStudyFixture(page, data);
   await page.emulateMedia({ reducedMotion: 'reduce' });
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     for (const shortcut of ['Control+k', '/']) {
-      await page.evaluate(() => { document.activeElement.blur(); window.scrollTo({ top: 2400, behavior: 'instant' }); });
+      await page.evaluate(() => { document.activeElement.blur(); document.querySelector('.sidebar').scrollTop = 0; window.scrollTo({ top: 2400, behavior: 'instant' }); });
       await page.waitForFunction(() => scrollY > 1000);
-      const before = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('#control-panel').getBoundingClientRect().top }));
+      const before = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('.sidebar').getBoundingClientRect().top, bottom: document.querySelector('.sidebar').getBoundingClientRect().bottom }));
       await page.evaluate(() => window.scrollBy({ top: 350, behavior: 'instant' }));
-      const after = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('#control-panel').getBoundingClientRect().top }));
-      assert.ok(before.top < 0 && after.top < before.top, JSON.stringify({ width, before, after }));
-      assert.ok(Math.abs((before.top - after.top) - (after.y - before.y)) < 2, JSON.stringify({ width, before, after }));
+      const after = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('.sidebar').getBoundingClientRect().top, bottom: document.querySelector('.sidebar').getBoundingClientRect().bottom }));
+      assert.ok(after.y > before.y, JSON.stringify({ width, before, after }));
+      if (width > 900) {
+        assert.ok(before.top >= 0 && after.top >= 0 && after.bottom <= 900, JSON.stringify({ width, before, after }));
+        assert.ok(Math.abs(before.top - after.top) < 2, JSON.stringify({ width, before, after }));
+      } else {
+        assert.ok(before.top < 0 && after.top < before.top, JSON.stringify({ width, before, after }));
+        assert.ok(Math.abs((before.top - after.top) - (after.y - before.y)) < 2, JSON.stringify({ width, before, after }));
+      }
       await page.keyboard.press(shortcut);
       await page.waitForFunction(() => {
         const search = document.querySelector('#keywordFilter'), rect = search.getBoundingClientRect();
@@ -1429,8 +1452,285 @@ test('sidebar scrolls with the document and search shortcuts return from deep qu
       assert.equal(await page.locator('#keywordFilter').isVisible(), true);
       assert.equal(await page.locator('.topic').count(), 60);
     }
+    if (width > 900) {
+      await page.evaluate(() => { document.querySelector('.sidebar').scrollTop = 0; window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' }); });
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const bottom = await page.evaluate(() => {
+        const panel = document.querySelector('.sidebar').getBoundingClientRect(), input = document.querySelector('#keywordFilter').getBoundingClientRect();
+        return { y: scrollY, maximum: document.documentElement.scrollHeight - innerHeight, sidebarTop: panel.top, sidebarBottom: panel.bottom,
+          inputTop: input.top, inputBottom: input.bottom, viewportHeight: innerHeight };
+      });
+      assert.ok(Math.abs(bottom.y - bottom.maximum) < 2, JSON.stringify(bottom));
+      assert.ok(bottom.sidebarTop >= 0 && bottom.sidebarBottom <= bottom.viewportHeight, JSON.stringify(bottom));
+      assert.ok(bottom.inputTop >= 0 && bottom.inputBottom <= bottom.viewportHeight, JSON.stringify(bottom));
+    }
   }
 }));
+
+test('a short desktop viewport keeps sidebar controls keyboard-accessible without trapping the reader', () => withPage(async page => {
+  const data = Array.from({ length: 60 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Single', ChapterName: 'Synthetic long chapter name '.repeat(8),
+    DegreeLevel: '简单', DetailHtml: '<p>Short viewport reading fixture.</p>'.repeat(6), SniffedAnswer: 'Synthetic answer' }));
+  await page.setViewportSize({ width: 1024, height: 480 });
+  await renderStudyFixture(page, data);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => window.scrollTo({ top: 1800, behavior: 'instant' }));
+  const initial = await page.locator('.sidebar').evaluate(sidebar => ({
+    tabindex: sidebar.getAttribute('tabindex'), label: sidebar.getAttribute('aria-label'), height: sidebar.clientHeight,
+    contentHeight: sidebar.scrollHeight, top: sidebar.getBoundingClientRect().top, bottom: sidebar.getBoundingClientRect().bottom,
+    docWidth: document.documentElement.scrollWidth, viewport: innerWidth
+  }));
+  assert.equal(initial.tabindex, '0');
+  assert.ok(initial.label?.trim());
+  assert.ok(initial.contentHeight > initial.height && initial.top >= 0 && initial.bottom <= 480, JSON.stringify(initial));
+  assert.ok(initial.docWidth <= initial.viewport, JSON.stringify(initial));
+  await page.locator('.sidebar').focus();
+  let reachedReset = false;
+  for (let step = 0; step < 20; step++) {
+    await page.keyboard.press('Tab');
+    const focus = await page.evaluate(() => {
+      const active = document.activeElement, sidebar = document.querySelector('.sidebar'), rect = active.getBoundingClientRect(), panel = sidebar.getBoundingClientRect();
+      return { id: active.id, inside: sidebar.contains(active), top: rect.top, bottom: rect.bottom, panelTop: panel.top, panelBottom: panel.bottom };
+    });
+    assert.equal(focus.inside, true, JSON.stringify(focus));
+    assert.ok(focus.top >= focus.panelTop - 1 && focus.bottom <= focus.panelBottom + 1, JSON.stringify(focus));
+    if (focus.id === 'resetFilters') { reachedReset = true; break; }
+  }
+  assert.equal(reachedReset, true);
+  assert.ok(await page.locator('.sidebar').evaluate(sidebar => sidebar.scrollTop > 0));
+  await page.keyboard.press('Control+k');
+  await page.waitForFunction(() => {
+    const input = document.querySelector('#keywordFilter'), rect = input.getBoundingClientRect(), panel = document.querySelector('.sidebar').getBoundingClientRect();
+    return document.activeElement === input && rect.top >= panel.top && rect.bottom <= panel.bottom;
+  });
+  await page.locator('#keywordFilter').fill('Short viewport');
+  await page.waitForFunction(() => document.querySelector('#visibleCount').textContent === '60');
+  const priorY = await page.evaluate(() => scrollY);
+  const question = await page.locator('.workspace').boundingBox();
+  await page.mouse.move(question.x + question.width / 2, 360);
+  await page.mouse.wheel(0, 400);
+  await page.waitForFunction(previous => scrollY > previous + 100, priorY);
+  assert.equal(await page.locator('#keywordFilter').inputValue(), 'Short viewport');
+  await page.setViewportSize({ width: 390, height: 480 });
+  await page.waitForFunction(() => !document.querySelector('#filterDetails').open);
+  await page.locator('#filterDetails summary').click();
+  await page.locator('#resetFilters').scrollIntoViewIfNeeded();
+  assert.equal(await page.locator('#resetFilters').isVisible(), true);
+  const mobile = await page.locator('.sidebar').evaluate(sidebar => ({ height: sidebar.clientHeight, content: sidebar.scrollHeight, top: sidebar.getBoundingClientRect().top,
+    questionTop: document.querySelector('.topic').getBoundingClientRect().top, bottom: sidebar.getBoundingClientRect().bottom }));
+  assert.ok(mobile.content <= mobile.height + 1, JSON.stringify(mobile));
+  assert.ok(mobile.questionTop >= mobile.bottom, JSON.stringify(mobile));
+}));
+
+test('repeated program copying preserves exact text and restores the normal feedback label', () => withPage(async page => {
+  await renderStudyFixture(page);
+  await page.evaluate(() => {
+    window.__repeatedCopies = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { window.__repeatedCopies.push(text); } } });
+  });
+  const button = page.locator('.reference-answer .copy-btn');
+  const expected = await page.locator('.reference-answer .code-box').textContent();
+  await button.click();
+  await page.waitForFunction(() => document.querySelector('.reference-answer .copy-btn').textContent === '复制成功');
+  await page.waitForTimeout(100);
+  await button.click();
+  await page.waitForTimeout(100);
+  await button.click();
+  await page.waitForFunction(() => window.__repeatedCopies.length === 3);
+  assert.deepEqual(await page.evaluate(() => __repeatedCopies), [expected, expected, expected]);
+  await page.waitForFunction(() => document.querySelector('.reference-answer .copy-btn').textContent === '一键复制', undefined, { timeout: 3000 });
+  await page.waitForTimeout(250);
+  assert.equal(await button.textContent(), '一键复制');
+}));
+
+async function decodedImageFixture(page, offscreen = false) {
+  return page.evaluate(async farAway => {
+    const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 200;
+    canvas.getContext('2d').fillRect(0, 0, 400, 200);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    const buffer = await blob.arrayBuffer(), unvalidated = buffer.slice(0);
+    const before = __test.getImageDimensions(buffer);
+    await __test.validateImageBuffer(buffer, 'image/png');
+    __test.setImages([
+      ['http://fixture.test/first.png', { filename: 'img_1.png', buffer, downloaded: true }],
+      ['http://fixture.test/second.png', { filename: 'img_2.png', buffer, downloaded: true }],
+      ['http://fixture.test/third.png', { filename: 'img_3.png', buffer, downloaded: true }],
+      ['http://fixture.test/unvalidated.png', { filename: 'img_4.png', buffer: unvalidated, downloaded: true }]
+    ]);
+    const detail = farAway
+      ? '<div style="height:18000px">Synthetic offscreen image fixture</div><img src="images/img_1.png" alt="Delayed good image"><img src="images/img_2.png" alt="Delayed error image">'
+      : '<p>Synthetic geometry fixture</p><img src="images/img_1.png" style="width:120px;height:7px" width="150" height="5" alt="Explicit style"><img src="images/img_2.png" alt="Natural dimensions"><img src="images/img_3.png" width="90" alt="Attribute display width"><img src="images/img_4.png" alt="Not validated">';
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'lazy-fixture', QuestionType: 'Blank', DetailHtml: detail, s2_done: true }]);
+    const html = __test.generateOfflineHtml(true), doc = new DOMParser().parseFromString(html, 'text/html');
+    return { html, png: canvas.toDataURL('image/png').split(',')[1], before: before || null, geometry: __test.getImageDimensions(buffer),
+      unvalidatedGeometry: __test.getImageDimensions(unvalidated) || null,
+      images: [...doc.querySelectorAll('.detail-box img')].map(image => ({ loading: image.getAttribute('loading'), decoding: image.getAttribute('decoding'),
+        width: image.getAttribute('width'), height: image.getAttribute('height'), styleWidth: image.style.width, aspectRatio: image.style.aspectRatio })) };
+  }, offscreen);
+}
+
+test('images decode asynchronously while only validated bytes supply natural geometry without replacing display width', () => withPage(async page => {
+  const result = await decodedImageFixture(page);
+  assert.equal(result.before, null);
+  assert.deepEqual(result.geometry, { width: 400, height: 200 });
+  assert.equal(result.unvalidatedGeometry, null);
+  assert.equal(result.images.length, 4);
+  for (const image of result.images) {
+    assert.equal(image.loading, 'eager'); assert.equal(image.decoding, 'async');
+  }
+  for (const image of result.images.slice(0, 3)) {
+    assert.equal(image.aspectRatio, '400 / 200');
+  }
+  assert.equal(result.images[0].width, '150'); assert.equal(result.images[0].styleWidth, '120px');
+  assert.equal(result.images[1].width, '400'); assert.equal(result.images[1].height, '200');
+  assert.equal(result.images[2].width, '90');
+  assert.equal(result.images[3].aspectRatio, '');
+  assert.equal(result.images[3].width, null); assert.equal(result.images[3].height, null);
+}));
+
+test('delayed local images reserve the same layout before decoding and are not mistaken for broken images', () => withPage(async page => {
+  const fixture = await decodedImageFixture(page);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route('**/images/*.png', async route => { await gate; await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') }); });
+  try {
+    await page.setContent(fixture.html, { waitUntil: 'domcontentloaded' });
+    const geometry = () => page.locator('.detail-box img').evaluateAll(images => images.slice(0,3).map(image => {
+      const rect = image.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, complete: image.complete };
+    }));
+    const before = await geometry();
+    assert.ok(before.every(image => !image.complete));
+    assert.equal(await page.locator('.img-failed').count(), 0);
+    assert.deepEqual(before.map(image => image.width), [120, 400, 90]);
+    assert.deepEqual(before.map(image => image.height), [60, 200, 45]);
+    release();
+    await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.complete && image.naturalWidth === 400));
+    const after = await geometry();
+    for (let index=0;index<before.length;index++) for (const field of ['x','y','width','height']) assert.ok(Math.abs(before[index][field]-after[index][field]) < 0.1, JSON.stringify({before,after}));
+    assert.equal(await page.locator('.img-failed').count(), 0);
+  } finally { release(); }
+}));
+
+test('print button and Ctrl or Meta P wait for cold offscreen images to load or fail before printing', async () => {
+  for (const trigger of ['button', 'Control+p', 'Meta+p']) await withPage(async page => {
+    const fixture = await decodedImageFixture(page, true);
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    const requested = [];
+    await page.route('**/images/*.png', async route => {
+      requested.push(route.request().url()); await gate;
+      if (route.request().url().endsWith('img_2.png')) await route.fulfill({ status: 404, body: 'Synthetic missing image' });
+      else await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') });
+    });
+    try {
+      await page.setContent(fixture.html, { waitUntil: 'domcontentloaded' });
+      await page.evaluate(() => { window.__printSnapshots = []; window.print = () => { __printSnapshots.push({
+        loaded: [...document.querySelectorAll('.detail-box img')].every(image => image.complete && image.naturalWidth > 0),
+        images: document.querySelectorAll('.detail-box img').length, missing: document.querySelectorAll('.img-failed').length
+      }); }; });
+      assert.equal(await page.locator('.detail-box img').count(), 2);
+      assert.equal(await page.locator('.img-failed').count(), 0);
+      assert.equal(await page.locator('.detail-box img').evaluateAll(images => images.every(image => !image.complete)), true);
+      if (trigger === 'button') await page.locator('#printBtn').click(); else await page.keyboard.press(trigger);
+      await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.loading === 'eager'));
+      assert.equal(await page.locator('#printBtn').isDisabled(), true);
+      assert.equal(await page.evaluate(() => __printSnapshots.length), 0);
+      // Repeated shortcuts while pending must not open a second print operation.
+      await page.keyboard.press('Control+p');
+      release();
+      await page.waitForFunction(() => __printSnapshots.length === 1 && !document.querySelector('#printBtn').disabled);
+      assert.deepEqual(await page.evaluate(() => __printSnapshots), [{ loaded: true, images: 1, missing: 1 }]);
+      assert.equal(requested.length, 2);
+      assert.equal(await page.locator('#printBtn').textContent(), '打印 / 保存 PDF');
+    } finally { release(); }
+  });
+});
+
+test('native print transitions retain delayed offscreen images until their local responses arrive', async () => {
+  for (const trigger of ['beforeprint', 'media']) await withPage(async page => {
+    const fixture = await decodedImageFixture(page, true);
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    const requested = [];
+    await page.route('**/images/*.png', async route => { requested.push(route.request().url()); await gate; await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') }); });
+    try {
+      await page.setContent(fixture.html, { waitUntil: 'domcontentloaded' });
+      assert.equal(await page.evaluate(() => scrollY), 0);
+      assert.equal(await page.locator('.detail-box img').evaluateAll(images => images.every(image => !image.complete)), true);
+      if (trigger === 'beforeprint') await page.evaluate(() => window.dispatchEvent(new Event('beforeprint')));
+      else await page.emulateMedia({ media: 'print' });
+      await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.loading === 'eager'));
+      release();
+      await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.complete && image.naturalWidth === 400));
+      assert.equal(requested.length, 2);
+      assert.equal(await page.locator('.img-failed').count(), 0);
+    } finally { release(); }
+  });
+});
+
+test('print preparation times out stalled loads or decodes, cleans listeners and can retry successfully', async () => {
+  const source = fs.readFileSync(sourcePath, 'utf8');
+  const timeoutDeclaration = 'const PRINT_PREPARE_TIMEOUT_MS = 30000;';
+  assert.equal(source.split(timeoutDeclaration).length, 2, 'production timeout must remain a bounded thirty seconds');
+  // Only the private test copy shortens the timeout; production and image bytes stay intact.
+  const instrumented = source.replace(timeoutDeclaration, 'const PRINT_PREPARE_TIMEOUT_MS = 150;');
+  for (const mode of ['load', 'decode']) {
+    const harness = await createHarness(browser, instrumented), page = harness.page;
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    try {
+      const fixture = await decodedImageFixture(page, true);
+      await page.route('**/images/*.png', async route => {
+        if (mode === 'load') await gate;
+        await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') });
+      });
+      await page.setContent(fixture.html, { waitUntil: 'domcontentloaded' });
+      await page.evaluate(stallDecode => {
+        window.__printCalls = 0; window.__unhandledPrintErrors = 0; window.__releaseDecodes = [];
+        window.print = () => { __printCalls++; };
+        window.addEventListener('unhandledrejection', () => { __unhandledPrintErrors++; });
+        const images = [...document.querySelectorAll('.detail-box img')];
+        window.__printListenerSets = images.map(image => {
+          const registrations = new Map(), add = image.addEventListener.bind(image), remove = image.removeEventListener.bind(image);
+          image.addEventListener = (type, callback, options) => {
+            if (['load','error'].includes(type)) registrations.set(callback,type);
+            add(type,callback,options);
+          };
+          image.removeEventListener = (type, callback, options) => { registrations.delete(callback); remove(type,callback,options); };
+          return registrations;
+        });
+        const decoders = images.map(image => image.decode.bind(image));
+        if (stallDecode) images.forEach(image => { image.decode = () => new Promise(resolve => __releaseDecodes.push(resolve)); });
+        window.__restoreImageDecodes = () => { images.forEach((image,index) => { image.decode = decoders[index]; }); __releaseDecodes.forEach(resolve => resolve()); };
+        window.__printTimers = new Set();
+        const set = window.setTimeout.bind(window), clear = window.clearTimeout.bind(window);
+        window.setTimeout = (callback, delay, ...args) => {
+          if (delay !== 150) return set(callback,delay,...args);
+          const handle = set(() => { __printTimers.delete(handle); callback(...args); },delay);
+          __printTimers.add(handle); return handle;
+        };
+        window.clearTimeout = handle => { __printTimers.delete(handle); clear(handle); };
+      }, mode === 'decode');
+      for (let attempt=0;attempt<2;attempt++) {
+        await page.locator('#printBtn').click();
+        await page.waitForFunction(() => {
+          const status = document.querySelector('#printStatus');
+          return status && !status.hidden && status.textContent.includes('超时') && !document.querySelector('#printBtn').disabled;
+        });
+        assert.match(await page.locator('#printStatus').textContent(), /未打开打印.*重试/);
+        assert.equal(await page.locator('#printStatus').getAttribute('role'), 'alert');
+        assert.equal(await page.locator('#printBtn').textContent(), '打印 / 保存 PDF');
+        assert.deepEqual(await page.evaluate(() => ({ prints:__printCalls, listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
+          { prints:0, listeners:0, timers:0, unhandled:0 }, mode);
+      }
+      release();
+      await page.evaluate(() => __restoreImageDecodes());
+      await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.complete && image.naturalWidth === 400));
+      await page.keyboard.press('Control+p');
+      await page.waitForFunction(() => __printCalls === 1 && !document.querySelector('#printBtn').disabled);
+      assert.equal(await page.locator('#printStatus').isVisible(), false);
+      assert.equal(await page.locator('#printStatus').count(), 1);
+      assert.deepEqual(await page.evaluate(() => ({ listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
+        { listeners:0, timers:0, unhandled:0 }, mode);
+    } finally { release(); await harness.close(); }
+  }
+});
 
 test('browser find reaches offscreen topic text and the reader does not intercept Ctrl F', () => withPage(async page => {
   const token = 'SyntheticBrowserFindLastTopicToken';

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.14.0
+// @version      7.15.0
 // @description  练习题干、选项与图片离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.14.0'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.15.0'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -56,6 +56,8 @@
 
     let allData = [];
     let imageQueue = new Map();
+    // Geometry belongs to the decoded bytes, not untrusted imported metadata.
+    const imageDimensions = new WeakMap();
     let imgCounter = 1;
     let engineRunning = false;
     let ocrWorkerPromise = null;
@@ -610,6 +612,7 @@
                 try {
                     if (typeof image.decode === 'function') await image.decode();
                     if (!image.naturalWidth || !image.naturalHeight) throw new Error('图片尺寸无效');
+                    imageDimensions.set(buffer,{width:image.naturalWidth,height:image.naturalHeight});
                     finish();
                 } catch (_) { finish(new Error('图片数据无法解码，未标记为已下载')); }
             };
@@ -1625,6 +1628,17 @@
                 }
                 if (/^images\/img_\d+\.[a-z0-9]{1,8}$/i.test(src) || /^data:image\/(png|jpe?g|gif|webp|bmp|avif);base64,[a-z0-9+/=\s]+$/i.test(src)) {
                     node.setAttribute('src', src);
+                    // Load local images up front to avoid layout work during rapid jumps.
+                    node.setAttribute('loading','eager');
+                    node.setAttribute('decoding','async');
+                    const dimensions = knownImage?.[1]?.buffer && imageDimensions.get(knownImage[1].buffer);
+                    if (dimensions) {
+                        // Keep the platform's explicit display width. Reserve the natural
+                        // ratio before loading, including images without source dimensions.
+                        if (!node.hasAttribute('width')) node.setAttribute('width',String(dimensions.width));
+                        if (!node.hasAttribute('height')) node.setAttribute('height',String(dimensions.height));
+                        node.style.aspectRatio = dimensions.width + ' / ' + dimensions.height;
+                    }
                     const originalUrl = safeUrl(original);
                     if (originalUrl) node.setAttribute('data-original', originalUrl);
                 } else {
@@ -1748,12 +1762,12 @@
         return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'"><title>Java 离线题库</title><style>${offlineViewerStyles()}</style></head>
 <body><a class="skip-link" href="#keywordFilter">跳到搜索</a><header class="site-header"><div class="brand"><span class="brand-mark" aria-hidden="true">J</span><div><p class="eyebrow">离线学习空间</p><h1>Java 题库</h1></div></div><div class="header-tools"><label class="theme-label"><span class="sr-only">显示主题</span><select id="themeToggle"><option value="auto">跟随系统</option><option value="light">浅色模式</option><option value="dark">深色模式</option></select></label></div></header>
-<div class="app-layout"><aside class="sidebar" aria-label="题目搜索与筛选"><section id="control-panel" class="search-panel" aria-label="搜索题目"><div class="search-title-row"><h2>查找题目</h2><span class="shortcut-hint"><kbd>/</kbd> 或 <kbd>Ctrl K</kbd> 搜索</span></div><div class="search-row"><label class="sr-only" for="keywordFilter">搜索关键词</label><input id="keywordFilter" type="search" autocomplete="off" spellcheck="false" placeholder="题干、选项或参考程序…"><button type="button" id="clearSearch" class="clear-button" aria-label="清空搜索">清空</button></div><div class="search-options"><label class="scope-label" for="searchScope">搜索范围 <select id="searchScope"><option value="full">全文（含答案）</option><option value="prompt">仅题目与选项</option></select></label><label class="scope-label" for="searchMatch">匹配方式 <select id="searchMatch"><option value="terms">多词同时匹配</option><option value="phrase">连续文本匹配</option></select></label></div></section><details id="filterDetails" class="filter-panel" open><summary><span>筛选</span><span class="filter-summary-hint">来源 · 章节 · 题型 · 难度</span></summary><div class="filter-body"><div class="filter-field"><label for="sourceFilter">来源</label><select id="sourceFilter"><option value="all">全部来源</option><option value="normal">常规题库</option><option value="illinois">伊利诺伊</option></select></div><div class="filter-field"><label for="chapterFilter">章节</label><select id="chapterFilter"><option value="all">全部章节</option>${optionList(chapters)}</select></div><div class="filter-field"><label for="typeFilter">题型</label><select id="typeFilter"><option value="all">全部题型</option>${Object.entries(typeNames).map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select></div><div class="filter-field"><label for="diffFilter">难度</label><select id="diffFilter"><option value="all">全部难度</option>${optionList(difficulties)}</select></div><button type="button" id="resetFilters" class="reset-button">重置筛选与搜索</button><div class="sidebar-guide"><h3>检索小提示</h3><p>多个关键词用空格分隔；选择“连续文本匹配”，可按原版方式查找完整短语。</p><p>选择“仅题目”，可排除答案内容，方便自测。</p></div></div></details></aside>
+<div class="app-layout"><aside class="sidebar" aria-label="题目搜索、筛选与答案控制" tabindex="0"><section id="control-panel" class="search-panel" aria-label="搜索题目"><div class="search-title-row"><h2>查找题目</h2><span class="shortcut-hint"><kbd>/</kbd> 或 <kbd>Ctrl K</kbd> 搜索</span></div><div class="search-row"><label class="sr-only" for="keywordFilter">搜索关键词</label><input id="keywordFilter" type="search" autocomplete="off" spellcheck="false" placeholder="题干、选项或参考程序…"><button type="button" id="clearSearch" class="clear-button" aria-label="清空搜索">清空</button></div><div class="search-options"><label class="scope-label" for="searchScope">搜索范围 <select id="searchScope"><option value="full">全文（含答案）</option><option value="prompt">仅题目与选项</option></select></label><label class="scope-label" for="searchMatch">匹配方式 <select id="searchMatch"><option value="terms">多词同时匹配</option><option value="phrase">连续文本匹配</option></select></label></div></section><div class="results-toolbar"><p id="resultStatus" role="status" aria-live="polite" aria-atomic="true">显示 <strong id="visibleCount">${allData.length}</strong><span class="result-total"> / ${allData.length} 道题</span></p><button type="button" id="toggleAnsBtn" class="global-answer-button" data-hidden="false">隐藏全部答案</button></div><button type="button" id="printBtn" class="print-button">打印 / 保存 PDF</button><details id="filterDetails" class="filter-panel" open><summary><span>筛选</span><span class="filter-summary-hint">来源 · 章节 · 题型 · 难度</span></summary><div class="filter-body"><div class="filter-field"><label for="sourceFilter">来源</label><select id="sourceFilter"><option value="all">全部来源</option><option value="normal">常规题库</option><option value="illinois">伊利诺伊</option></select></div><div class="filter-field"><label for="chapterFilter">章节</label><select id="chapterFilter"><option value="all">全部章节</option>${optionList(chapters)}</select></div><div class="filter-field"><label for="typeFilter">题型</label><select id="typeFilter"><option value="all">全部题型</option>${Object.entries(typeNames).map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select></div><div class="filter-field"><label for="diffFilter">难度</label><select id="diffFilter"><option value="all">全部难度</option>${optionList(difficulties)}</select></div><button type="button" id="resetFilters" class="reset-button">重置筛选与搜索</button><div class="sidebar-guide"><h3>检索小提示</h3><p>多个关键词用空格分隔；选择“连续文本匹配”，可按原版方式查找完整短语。</p><p>选择“仅题目”，可排除答案内容，方便自测。</p></div></div></details></aside>
 <main id="mainContent" class="workspace">
 <section id="extraction-summary" class="content-summary" aria-label="全库内容来源与提取情况" data-warning-count="${warningCount}" data-platform-reference-count="${referenceCount}" data-validated-answer-count="${validatedCount}" data-provided-answer-count="${providedCount}" data-ai-answer-count="${aiCount}" data-source-unavailable-count="${unavailableImages}" data-image-saved-count="${savedImages}" data-image-total-count="${imageRecords.length}" data-image-pending-count="${pendingImages}"><div class="summary-cell"><span class="summary-count">${validatedCount + providedCount}</span><span>平台答案<small>直接提供 ${providedCount} · 校验 ${validatedCount}</small></span></div><div class="summary-cell"><span class="summary-count">${referenceCount}</span><span>平台参考程序<small>未运行验证</small></span></div><div class="summary-cell"><span class="summary-count">${aiCount}</span><span>AI 解答<small>需自行核对</small></span></div><div class="summary-cell${warningCount ? ' has-warning' : ''}"><span class="summary-count">${warningCount}</span><span>提取提醒<small>${warningCount ? '详见对应题目' : '无提取提醒'}</small></span></div></section>
 ${imageRecords.length ? `<div class="image-integrity${unavailableImages || pendingImages ? ' integrity-warning' : ''}" role="note">全库图片：已保存 ${savedImages} / ${imageRecords.length} 张。${unavailableImages ? ` ${unavailableImages} 张平台原图不可用（HTTP 404/410），对应题目的图像内容不完整；原图提示和手动访问链接已保留。` : ''}${pendingImages ? ` 还有 ${pendingImages} 张未保存，当前文件不是图片完整的离线副本。` : ''}</div>` : ''}
 ${isFinal ? '' : '<div class="snapshot-notice" role="note">这是尚未完成的断点包，部分题目、答案或图片可能仍待提取。</div>'}
-<div class="results-toolbar"><p id="resultStatus" role="status" aria-live="polite" aria-atomic="true">显示 <strong id="visibleCount">${allData.length}</strong><span class="result-total"> / ${allData.length} 道题</span></p><button type="button" id="toggleAnsBtn" class="global-answer-button" data-hidden="false">隐藏全部答案</button></div><div id="emptyState" class="empty-state" hidden><p class="empty-title">没有找到匹配的题目</p><p>试试更短的关键词，或调整来源、章节、题型与难度。</p><button type="button" class="empty-reset">清空筛选，查看全部题目</button></div><div id="questions-container">${cards}</div><footer class="viewer-footer">全部检索与阅读均在本地完成。参考程序和 AI 解答需自行核对。</footer></main></div><button type="button" id="back-to-top" aria-label="回到页面顶部" hidden>回到顶部</button><script>${offlineViewerRuntime.toString()}
+<div id="emptyState" class="empty-state" hidden><p class="empty-title">没有找到匹配的题目</p><p>试试更短的关键词，或调整来源、章节、题型与难度。</p><button type="button" class="empty-reset">清空筛选，查看全部题目</button></div><div id="questions-container">${cards}</div><footer class="viewer-footer">全部检索与阅读均在本地完成。参考程序和 AI 解答需自行核对。</footer></main></div><button type="button" id="back-to-top" aria-label="回到页面顶部" hidden>回到顶部</button><script>${offlineViewerRuntime.toString()}
 offlineViewerRuntime();</script></body></html>`;
     }
 
@@ -1771,6 +1785,7 @@ offlineViewerRuntime();</script></body></html>`;
         const count = byId('visibleCount');
         const empty = byId('emptyState');
         const globalToggle = byId('toggleAnsBtn');
+        const printButton = byId('printBtn');
         const normalize = value => String(value || '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
         const topics = Array.from(document.querySelectorAll('.topic')).map(element => {
             const prompt = normalize([element.querySelector('.question-meta')?.textContent, element.querySelector('.question-origin')?.textContent, element.querySelector('.type-pill')?.textContent, element.querySelector('.difficulty')?.textContent, element.querySelector('.detail-box')?.textContent].join(' '));
@@ -1786,10 +1801,11 @@ offlineViewerRuntime();</script></body></html>`;
             const query = normalize(search.value);
             const tokens = match.value === 'phrase' ? (query ? [query] : []) : [...new Set(query.split(' ').filter(Boolean))];
             const usePrompt = scope.value === 'prompt';
+            const selectedSource = source.value, selectedChapter = chapter.value, selectedType = type.value, selectedDifficulty = difficulty.value;
             let shown = 0;
             for (const item of topics) {
                 const text = usePrompt ? item.prompt : item.full;
-                const visible = (source.value === 'all' || item.source === source.value) && (chapter.value === 'all' || item.chapter === chapter.value) && (type.value === 'all' || item.type === type.value) && (difficulty.value === 'all' || item.diff === difficulty.value) && tokens.every(token => text.includes(token));
+                const visible = (selectedSource === 'all' || item.source === selectedSource) && (selectedChapter === 'all' || item.chapter === selectedChapter) && (selectedType === 'all' || item.type === selectedType) && (selectedDifficulty === 'all' || item.diff === selectedDifficulty) && tokens.every(token => text.includes(token));
                 if (visible !== item.visible) {
                     item.element.classList.toggle('hidden', !visible);
                     item.element.setAttribute('aria-hidden', String(!visible));
@@ -1797,9 +1813,9 @@ offlineViewerRuntime();</script></body></html>`;
                 }
                 if (visible) shown++;
             }
-            count.textContent = String(shown);
-            empty.hidden = shown !== 0;
-            clear.disabled = search.value.length === 0;
+            if (count.textContent !== String(shown)) count.textContent = String(shown);
+            if (empty.hidden !== (shown !== 0)) empty.hidden = shown !== 0;
+            if (clear.disabled !== (search.value.length === 0)) clear.disabled = search.value.length === 0;
         }
         function scheduleFilter() { clearTimeout(searchTimer); if (!composing) searchTimer = setTimeout(filterTopics, 150); }
         function clearQuery() { search.value = ''; composing = false; filterTopics(); }
@@ -1814,6 +1830,7 @@ offlineViewerRuntime();</script></body></html>`;
         document.querySelector('.empty-reset').addEventListener('click', resetFilters);
         document.addEventListener('keydown', event => {
             if (event.defaultPrevented || event.isComposing || composing) return;
+            if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'p') { event.preventDefault(); preparePrint(); return; }
             const editable = event.target instanceof Element && !!event.target.closest('input,textarea,select,[contenteditable="true"],[contenteditable=""]');
             const focusShortcut = ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'k') || (!editable && !event.ctrlKey && !event.metaKey && !event.altKey && event.key === '/');
             if (focusShortcut) { event.preventDefault(); search.focus(); search.select(); }
@@ -1821,6 +1838,7 @@ offlineViewerRuntime();</script></body></html>`;
         });
         const answers = Array.from(document.querySelectorAll('.answer-toggle')).map(button => ({ button, box: byId(button.getAttribute('aria-controls')) }));
         function setAnswer(item, visible) {
+            if (item.box.hidden === !visible) return;
             item.box.hidden = !visible;
             item.button.setAttribute('aria-expanded', String(visible));
             item.button.textContent = visible ? '隐藏答案' : '查看答案';
@@ -1831,9 +1849,18 @@ offlineViewerRuntime();</script></body></html>`;
             globalToggle.dataset.hidden = String(!anyVisible);
             globalToggle.textContent = answers.length === 0 ? '暂无可显示的答案' : anyVisible ? '隐藏全部答案' : '显示全部答案';
         }
-        for (const item of answers) item.button.addEventListener('click', () => { setAnswer(item, item.box.hidden); updateGlobalToggle(); });
         globalToggle.addEventListener('click', () => { const show = !answers.some(item => !item.box.hidden); answers.forEach(item => setAnswer(item, show)); updateGlobalToggle(); });
-        document.querySelectorAll('.copy-btn').forEach(button => button.addEventListener('click', async () => {
+        // One delegated handler avoids a retained callback for every answer and program.
+        const copyTimers = new WeakMap();
+        const copyRequests = new WeakMap();
+        byId('questions-container').addEventListener('click', async event => {
+            const button = event.target instanceof Element && event.target.closest('.answer-toggle,.copy-btn');
+            if (!button) return;
+            if (button.classList.contains('answer-toggle')) {
+                const item = {button,box:byId(button.getAttribute('aria-controls'))};
+                setAnswer(item,item.box.hidden); updateGlobalToggle(); return;
+            }
+            const request = (copyRequests.get(button) || 0) + 1; copyRequests.set(button,request);
             const code = button.closest('.code-container').querySelector('.code-box').textContent;
             let copied = false;
             try { if (navigator.clipboard) { await navigator.clipboard.writeText(code); copied = true; } } catch (_) {}
@@ -1847,10 +1874,12 @@ offlineViewerRuntime();</script></body></html>`;
                 finally { document.removeEventListener('copy', copyExactText); }
                 textarea.remove(); button.focus({preventScroll:true});
             }
-            const old = button.textContent; button.textContent = copied ? '复制成功' : '复制失败，请手动选择';
+            if (copyRequests.get(button) !== request) return;
+            clearTimeout(copyTimers.get(button));
+            button.textContent = copied ? '复制成功' : '复制失败，请手动选择';
             button.setAttribute('aria-live', 'polite');
-            setTimeout(() => { button.textContent = old; }, 1800);
-        }));
+            copyTimers.set(button,setTimeout(() => { button.textContent = '一键复制'; copyTimers.delete(button); },1800));
+        });
         const theme = byId('themeToggle');
         const systemTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
         function toggleTheme() { document.body.classList.toggle('dark-mode', theme.value === 'dark' || (theme.value === 'auto' && !!systemTheme?.matches)); }
@@ -1875,6 +1904,75 @@ offlineViewerRuntime();</script></body></html>`;
             img.addEventListener('error', showMissing, {once:true});
             if (img.complete && img.naturalWidth === 0) showMissing();
         });
+        let preparingPrint = false;
+        const PRINT_PREPARE_TIMEOUT_MS = 30000;
+        function loadPrintImages(signal) {
+            return Array.from(document.querySelectorAll('.detail-box img,.answer-content img'),image => {
+                image.loading = 'eager'; image.decoding = 'sync';
+                // Native beforeprint cannot await preparation: request images without
+                // retaining listeners. The explicit print path supplies cancellation.
+                if (!signal) return Promise.resolve();
+                return new Promise((resolve,reject) => {
+                    let settled = false, decoding = false;
+                    const finish = error => {
+                        if (settled) return;
+                        settled = true;
+                        image.removeEventListener('load',loaded); image.removeEventListener('error',failed);
+                        signal.removeEventListener('abort',aborted);
+                        if (error) reject(error); else resolve();
+                    };
+                    const aborted = () => finish(new Error('PRINT_PREPARATION_ABORTED'));
+                    const failed = () => finish(); // The viewer's existing error handler shows the missing-image notice.
+                    const loaded = () => {
+                        if (settled || decoding) return;
+                        decoding = true;
+                        if (!image.naturalWidth || typeof image.decode !== 'function') { finish(); return; }
+                        Promise.resolve().then(() => image.decode()).then(() => finish(),() => finish());
+                    };
+                    image.addEventListener('load',loaded,{once:true}); image.addEventListener('error',failed,{once:true});
+                    signal.addEventListener('abort',aborted,{once:true});
+                    if (signal.aborted) aborted(); else if (image.complete) loaded();
+                });
+            });
+        }
+        async function preparePrint() {
+            if (preparingPrint) return;
+            preparingPrint = true; printButton.disabled = true;
+            printButton.textContent = '正在准备完整图片…';
+            let notice = byId('printStatus');
+            if (!notice) {
+                notice = document.createElement('p'); notice.id = 'printStatus'; notice.setAttribute('role','alert');
+                notice.style.cssText = 'margin:0 0 14px;color:var(--warning);font-size:12px;line-height:1.7';
+                printButton.after(notice);
+            }
+            notice.hidden = true;
+            const controller = new AbortController();
+            let timedOut = false, firstFrame, secondFrame, abortWait;
+            const timeout = setTimeout(() => { timedOut = true; controller.abort(); },PRINT_PREPARE_TIMEOUT_MS);
+            try {
+                const cancelled = new Promise((_,reject) => { abortWait = () => reject(new Error('PRINT_PREPARATION_ABORTED')); controller.signal.addEventListener('abort',abortWait,{once:true}); });
+                const prepared = Promise.all(loadPrintImages(controller.signal)).then(() => new Promise(resolve => {
+                    firstFrame = requestAnimationFrame(() => { secondFrame = requestAnimationFrame(resolve); });
+                }));
+                await Promise.race([prepared,cancelled]);
+                clearTimeout(timeout);
+                window.print();
+            } catch (_) {
+                notice.textContent = timedOut ? '图片准备超时，未打开打印。请检查本地图片后重试。' : '打印未能打开，请稍后重试。';
+                notice.hidden = false;
+            } finally {
+                clearTimeout(timeout); controller.signal.removeEventListener('abort',abortWait); controller.abort();
+                cancelAnimationFrame(firstFrame); cancelAnimationFrame(secondFrame);
+                preparingPrint = false; printButton.disabled = false; printButton.textContent = '打印 / 保存 PDF';
+            }
+        }
+        printButton.addEventListener('click',preparePrint);
+        // Browser-menu printing also requests every original image synchronously.
+        window.addEventListener('beforeprint',() => { loadPrintImages(); });
+        const printMedia = window.matchMedia && window.matchMedia('print');
+        const loadForPrintMedia = event => { if (event.matches) loadPrintImages(); };
+        if (printMedia?.addEventListener) printMedia.addEventListener('change',loadForPrintMedia);
+        else if (printMedia?.addListener) printMedia.addListener(loadForPrintMedia);
         const topButton = byId('back-to-top');
         topButton.addEventListener('click', () => window.scrollTo({top:0, behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}));
         const updateTopButton = () => { const hidden = window.scrollY <= 500; if (topButton.hidden !== hidden) topButton.hidden = hidden; };
@@ -1890,19 +1988,19 @@ offlineViewerRuntime();</script></body></html>`;
         .dark-mode{color-scheme:dark;--bg:#121c1d;--surface:#1b2829;--surface-soft:#213032;--ink:#e2eeeb;--muted:#b1c4bf;--faint:#93aaa4;--line:#344747;--accent:#7ad4bd;--accent-hover:#a2e5d3;--accent-soft:#1d403a;--warning:#efd28d;--warning-bg:#352e1d;--warning-line:#68572d;--shadow:none;--code:#142123;--focus:#7ad4bd}
         *{box-sizing:border-box}html{scroll-padding-top:20px}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:15px;line-height:1.6}button,input,select{font:inherit}button,select{cursor:pointer}button{color:inherit}button:disabled{cursor:default;opacity:.55}a{color:var(--accent);text-underline-offset:3px}button,input,select,a,summary,pre[tabindex]{outline-offset:4px}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible,pre[tabindex]:focus-visible{outline:2px solid var(--focus)}button{touch-action:manipulation}h1,h2,h3,p{margin:0}select,input{color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;min-width:0}select{padding:10px 30px 10px 12px;max-width:100%}input::-webkit-search-cancel-button{display:none}.hidden,[hidden]{display:none!important}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.skip-link{position:fixed;top:-100px;left:20px;background:var(--surface);padding:12px 20px;z-index:100}.skip-link:focus{top:12px}
         .site-header{max-width:1440px;margin:0 auto;padding:32px 48px 27px;display:flex;align-items:center;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:14px;align-items:center}.brand-mark{display:grid;place-items:center;width:46px;height:46px;border:1px solid var(--accent);border-radius:13px;background:var(--accent);color:var(--surface);font-size:28px;line-height:1;font-weight:700;font-family:Georgia,serif}.dark-mode .brand-mark{color:#122923}.eyebrow{font-size:11px;font-weight:650;letter-spacing:.16em;color:var(--muted);margin-bottom:3px}h1{font-size:24px;line-height:1.3;letter-spacing:-.03em;font-weight:680}.header-tools{display:flex;align-items:center;gap:22px}.theme-label select{font-size:12px;padding:8px 28px 8px 10px;background:transparent}
-        .app-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:32px;max-width:1440px;margin:0 auto;padding:30px 48px 64px}.sidebar{min-width:0;align-self:start}.filter-panel{position:static}.filter-panel>summary{display:none}.filter-intro{padding:5px 0 24px}.filter-intro h2{font-size:15px;font-weight:700}.filter-intro p{margin-top:6px;font-size:12px;color:var(--faint)}.filter-field{display:flex;flex-direction:column;gap:8px;margin-bottom:20px}.filter-field label{font-size:12px;font-weight:650;color:var(--muted)}.filter-field select{width:100%;font-size:13px;min-height:43px;background:var(--surface)}.reset-button{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:transparent;font-size:12px;color:var(--muted)}.reset-button:hover{background:var(--surface);color:var(--ink)}.sidebar-guide{margin-top:28px;padding-top:23px;border-top:1px solid var(--line);color:var(--faint);font-size:12px;line-height:1.9}.sidebar-guide h3{font-size:12px;font-weight:650;color:var(--muted);margin-bottom:8px}.sidebar-guide p+p{margin-top:10px}.workspace{min-width:0}.search-panel{position:static;background:var(--surface);padding:16px;margin-bottom:22px;border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow)}.search-title-row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;margin-bottom:13px}.search-title-row h2{font-size:14px;letter-spacing:-.01em}.shortcut-hint{font-size:10px;color:var(--faint);display:flex;align-items:center;gap:5px}kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;background:var(--surface-soft);font-size:11px;line-height:1.7}.search-row{display:flex;align-items:center;gap:10px;position:relative}.search-row input{flex:1;width:100%;height:44px;padding:9px 52px 9px 10px;background:var(--surface-soft);font-size:15px;border-color:var(--line)}.search-row input::placeholder{color:var(--faint)}.search-row input:focus{border-color:var(--accent);background:var(--surface)}.clear-button{position:absolute;right:10px;top:9px;height:29px;padding:2px 8px;border:0;border-radius:5px;background:transparent;font-size:12px;color:var(--muted)}.clear-button:not(:disabled):hover{background:var(--accent-soft);color:var(--accent)}.search-options{display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:11px;font-size:11px;color:var(--faint)}.scope-label{display:grid;grid-template-columns:56px minmax(0,1fr);align-items:center;gap:6px;white-space:nowrap}.scope-label select{width:100%;min-height:33px;padding:4px 20px 4px 6px;font-size:11px;border:1px solid var(--line);background:var(--surface);color:var(--muted)}.search-help{white-space:nowrap}
-        .content-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:20px 0 22px;padding:0 3px}.summary-cell{display:flex;align-items:center;gap:11px;font-size:11px;color:var(--muted);border-right:1px solid var(--line);padding-right:10px;min-width:0}.summary-cell:last-child{border-right:0}.summary-count{font-size:22px;font-variant-numeric:tabular-nums;font-weight:600;line-height:1.3;letter-spacing:-.04em;color:var(--ink)}.summary-cell small{display:block;color:var(--faint);font-size:10px;line-height:1.5}.summary-cell.has-warning .summary-count{color:var(--warning)}.snapshot-notice{padding:13px 16px;background:var(--warning-bg);border:1px solid var(--warning-line);border-radius:8px;color:var(--warning);font-size:12px;margin-bottom:20px}.results-toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:0 2px 14px}.results-toolbar p{font-size:13px;color:var(--muted)}#visibleCount{color:var(--ink);font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}.result-total{font-size:12px;color:var(--faint)}.global-answer-button{padding:5px 0 5px 12px;border:0;background:transparent;color:var(--accent);font-size:12px;font-weight:600}.global-answer-button:not(:disabled):hover{text-decoration:underline;text-underline-offset:3px}
+        .app-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:32px;max-width:1440px;margin:0 auto;padding:30px 48px 0}.sidebar:focus-visible{outline:2px solid var(--focus);outline-offset:2px}.sidebar{min-width:0;min-height:0;align-self:start;position:sticky;top:16px;max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:4px 8px 6px 4px}.print-button{width:100%;padding:9px 10px;margin:0 0 18px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--muted);font-size:12px}.print-button:not(:disabled):hover{color:var(--accent);border-color:var(--accent)}.filter-panel{position:static}.filter-panel>summary{display:none}.filter-intro{padding:5px 0 24px}.filter-intro h2{font-size:15px;font-weight:700}.filter-intro p{margin-top:6px;font-size:12px;color:var(--faint)}.filter-field{display:flex;flex-direction:column;gap:8px;margin-bottom:20px}.filter-field label{font-size:12px;font-weight:650;color:var(--muted)}.filter-field select{width:100%;font-size:13px;min-height:43px;background:var(--surface)}.reset-button{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:transparent;font-size:12px;color:var(--muted)}.reset-button:hover{background:var(--surface);color:var(--ink)}.sidebar-guide{margin-top:28px;padding-top:23px;border-top:1px solid var(--line);color:var(--faint);font-size:12px;line-height:1.9}.sidebar-guide h3{font-size:12px;font-weight:650;color:var(--muted);margin-bottom:8px}.sidebar-guide p+p{margin-top:10px}.workspace{min-width:0;padding-bottom:64px}.search-panel{position:static;background:var(--surface);padding:16px;margin-bottom:22px;border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow)}.search-title-row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;margin-bottom:13px}.search-title-row h2{font-size:14px;letter-spacing:-.01em}.shortcut-hint{font-size:10px;color:var(--faint);display:flex;align-items:center;gap:5px}kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;background:var(--surface-soft);font-size:11px;line-height:1.7}.search-row{display:flex;align-items:center;gap:10px;position:relative}.search-row input{flex:1;width:100%;height:44px;padding:9px 52px 9px 10px;background:var(--surface-soft);font-size:15px;border-color:var(--line)}.search-row input::placeholder{color:var(--faint)}.search-row input:focus{border-color:var(--accent);background:var(--surface)}.clear-button{position:absolute;right:10px;top:9px;height:29px;padding:2px 8px;border:0;border-radius:5px;background:transparent;font-size:12px;color:var(--muted)}.clear-button:not(:disabled):hover{background:var(--accent-soft);color:var(--accent)}.search-options{display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:11px;font-size:11px;color:var(--faint)}.scope-label{display:grid;grid-template-columns:56px minmax(0,1fr);align-items:center;gap:6px;white-space:nowrap}.scope-label select{width:100%;min-height:33px;padding:4px 20px 4px 6px;font-size:11px;border:1px solid var(--line);background:var(--surface);color:var(--muted)}.search-help{white-space:nowrap}
+        .content-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:20px 0 22px;padding:0 3px}.summary-cell{display:flex;align-items:center;gap:11px;font-size:11px;color:var(--muted);border-right:1px solid var(--line);padding-right:10px;min-width:0}.summary-cell:last-child{border-right:0}.summary-count{font-size:22px;font-variant-numeric:tabular-nums;font-weight:600;line-height:1.3;letter-spacing:-.04em;color:var(--ink)}.summary-cell small{display:block;color:var(--faint);font-size:10px;line-height:1.5}.summary-cell.has-warning .summary-count{color:var(--warning)}.snapshot-notice{padding:13px 16px;background:var(--warning-bg);border:1px solid var(--warning-line);border-radius:8px;color:var(--warning);font-size:12px;margin-bottom:20px}.results-toolbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin:0 0 18px;padding:12px 2px;border-block:1px solid var(--line)}.results-toolbar p{font-size:13px;color:var(--muted)}#visibleCount{color:var(--ink);font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}.result-total{font-size:12px;color:var(--faint)}.global-answer-button{padding:7px 0;border:0;background:transparent;color:var(--accent);font-size:12px;font-weight:600}.global-answer-button:not(:disabled):hover{text-decoration:underline;text-underline-offset:3px}
         /* Lay out every question before reading; isolate cards without viewport-triggered reflow. */
         .topic{contain:layout style;background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:25px 28px 22px;margin-bottom:18px;box-shadow:var(--shadow);scroll-margin-top:20px}.question-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:11px}.question-ident{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.question-number{font:12px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--faint);margin-right:2px;font-variant-numeric:tabular-nums}.type-pill{font-size:11px;padding:3px 8px;border-radius:5px;color:var(--accent);background:var(--accent-soft);font-weight:600}.question-origin{font-size:10px;padding:3px 7px;border:1px solid var(--warning-line);border-radius:5px;color:var(--warning);background:var(--warning-bg)}.difficulty{font-size:11px;color:var(--faint)}.answer-source{font-size:10px;white-space:nowrap;color:var(--faint);padding:2px 0}.source-verified,.source-reference{color:var(--accent)}.source-ai{color:var(--muted)}.source-warning{color:var(--warning)}.question-meta{font-size:11px;color:var(--muted);margin-bottom:19px;overflow-wrap:anywhere}.meta-label{color:var(--faint);margin-right:7px}.detail-box{font-size:15px;line-height:1.85;overflow-wrap:anywhere;overflow-x:auto}.detail-box p{margin:0 0 12px}.detail-box p:last-child{margin-bottom:0}.detail-box h1,.detail-box h2,.detail-box h3{font-size:16px;margin:12px 0 8px;line-height:1.6}.detail-box pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface-soft);padding:13px 16px;border-radius:7px;font:13px/1.75 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}.detail-box code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em}.detail-box ul,.detail-box ol{padding-left:22px;margin:10px 0}.detail-box li{margin:6px 0}.detail-box label{display:block;margin:9px 0}.detail-box input[type=radio],.detail-box input[type=checkbox]{margin:0 8px 0 0;accent-color:var(--accent)}.detail-box table{max-width:100%;border-collapse:collapse;font-size:13px}.detail-box td,.detail-box th{padding:8px 12px;border:1px solid var(--line);text-align:left}.requirement-box{padding:12px 15px;margin-top:14px;background:var(--surface-soft);border-left:3px solid var(--line);border-radius:0 6px 6px 0}img{max-width:100%;height:auto;vertical-align:middle}.detail-box img,.answer-content img{height:auto!important;display:block;margin:10px 0;border-radius:5px}.extraction-warning{display:flex;gap:10px;align-items:flex-start;margin-top:18px;padding:12px 15px;border:1px solid var(--warning-line);border-radius:8px;background:var(--warning-bg);color:var(--warning);font-size:12px;line-height:1.7;overflow-wrap:anywhere}.extraction-warning strong{white-space:nowrap;font-size:11px;margin-top:1px}.answer-section{margin-top:21px;padding-top:14px;border-top:1px solid var(--line)}.answer-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.answer-caption{font-size:11px;font-weight:600;color:var(--faint)}.answer-toggle{background:transparent;color:var(--accent);border:0;padding:3px 0 3px 12px;font-size:12px;font-weight:600}.answer-toggle:hover{text-decoration:underline;text-underline-offset:3px}.answer-box{margin-top:12px}.answer-heading{font-size:11px;color:var(--muted);margin-bottom:10px}.answer-content{font-size:14px;line-height:1.8;overflow-wrap:anywhere}.plain-answer{white-space:pre-wrap}.answer-status{margin-top:20px;border-top:1px solid var(--line);padding-top:13px;color:var(--faint);font-size:11px}.code-container{position:relative}.code-language{position:absolute;top:12px;left:17px;font-size:10px;letter-spacing:.12em;color:var(--faint);font-weight:650;pointer-events:none}.code-box{margin:0;background:var(--code);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:43px 17px 17px;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:560px;max-height:60vh;font:13px/1.8 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:4}.copy-btn{position:absolute;top:8px;right:10px;padding:4px 9px;background:var(--surface);border:1px solid var(--line);border-radius:5px;color:var(--muted);font-size:10px}.copy-btn:hover{border-color:var(--accent);color:var(--accent)}.img-failed{margin:12px 0;padding:15px;border:1px dashed var(--warning-line);border-radius:7px;background:var(--warning-bg);color:var(--warning);font-size:12px;overflow-wrap:anywhere}.img-failed a{color:inherit}
         /* Hidden results and answers retain layout caches; unsupported browsers use display:none. */
         @supports(content-visibility:hidden){.topic.hidden,.answer-box[hidden]{display:block!important;content-visibility:hidden;contain:size layout style;block-size:0;min-block-size:0;padding-block:0;border-block-width:0;margin-block:0;overflow:clip;box-shadow:none;background:transparent}}
         .empty-state{background:var(--surface);border:1px dashed var(--line);border-radius:13px;text-align:center;padding:55px 20px 58px;color:var(--muted)}.empty-title{font-size:18px;font-weight:650;color:var(--ink);margin-bottom:8px}.empty-state>p:not(.empty-title){font-size:13px}.empty-reset{margin-top:24px;border:1px solid var(--accent);border-radius:7px;padding:10px 16px;color:var(--accent);background:var(--accent-soft);font-size:12px}.empty-reset:hover{background:var(--surface)}.viewer-footer{padding:18px 0 5px;font-size:11px;line-height:1.8;color:var(--faint);text-align:center}#back-to-top{position:fixed;bottom:24px;right:24px;z-index:12;background:var(--surface);color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:10px 13px;font-size:11px;box-shadow:var(--shadow)}
-        @media(min-width:1600px){.app-layout{grid-template-columns:280px minmax(0,1fr);gap:32px}}@media(max-width:1100px){.site-header{padding:26px 28px 24px}.app-layout{padding:26px 28px 50px;grid-template-columns:260px minmax(0,1fr);gap:24px}.search-panel{padding:18px}.topic{padding:22px}.content-summary{gap:9px}.summary-cell{gap:7px;font-size:10px}.summary-count{font-size:20px}}
-        @media(max-width:900px){html{scroll-padding-top:20px}.site-header{padding:24px}.app-layout{display:block;padding:20px 24px 45px}.sidebar{margin-bottom:16px}.filter-panel{position:static;background:var(--surface);border:1px solid var(--line);border-radius:10px}.filter-panel>summary{display:flex;align-items:center;justify-content:space-between;padding:13px 17px;cursor:pointer;list-style:none;font-size:13px;font-weight:600;gap:15px}.filter-panel>summary::-webkit-details-marker{display:none}.filter-panel>summary:after{content:"+";font-size:18px;font-weight:400;color:var(--accent)}.filter-panel[open]>summary:after{content:"−"}.filter-summary-hint{margin-left:auto;font-size:10px;font-weight:400;color:var(--faint)}.filter-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:3px 17px 17px}.filter-intro,.sidebar-guide{display:none}.filter-field{margin:0;gap:6px}.filter-field select{font-size:12px}.reset-button{grid-column:1/-1;margin-top:0}.search-panel{position:static}.topic{scroll-margin-top:20px}.content-summary{gap:14px;margin-top:19px}.summary-cell{font-size:11px;gap:10px}.summary-count{font-size:22px}}
+        @media(min-width:1600px){.app-layout{grid-template-columns:280px minmax(0,1fr);gap:32px}}@media(max-width:1100px){.site-header{padding:26px 28px 24px}.workspace{padding-bottom:50px}.app-layout{padding:26px 28px 0;grid-template-columns:260px minmax(0,1fr);gap:24px}.search-panel{padding:18px}.topic{padding:22px}.content-summary{gap:9px}.summary-cell{gap:7px;font-size:10px}.summary-count{font-size:20px}}
+        @media(max-width:900px){html{scroll-padding-top:20px}.site-header{padding:24px}.app-layout{display:block;padding:20px 24px 45px}.workspace{padding-bottom:0}.sidebar{position:static;max-height:none;overflow:visible;scrollbar-gutter:auto;padding:0;margin-bottom:16px}.filter-panel{position:static;background:var(--surface);border:1px solid var(--line);border-radius:10px}.filter-panel>summary{display:flex;align-items:center;justify-content:space-between;padding:13px 17px;cursor:pointer;list-style:none;font-size:13px;font-weight:600;gap:15px}.filter-panel>summary::-webkit-details-marker{display:none}.filter-panel>summary:after{content:"+";font-size:18px;font-weight:400;color:var(--accent)}.filter-panel[open]>summary:after{content:"−"}.filter-summary-hint{margin-left:auto;font-size:10px;font-weight:400;color:var(--faint)}.filter-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:3px 17px 17px}.filter-intro,.sidebar-guide{display:none}.filter-field{margin:0;gap:6px}.filter-field select{font-size:12px}.reset-button{grid-column:1/-1;margin-top:0}.search-panel{position:static}.topic{scroll-margin-top:20px}.content-summary{gap:14px;margin-top:19px}.summary-cell{font-size:11px;gap:10px}.summary-count{font-size:22px}}
         @media(max-width:540px){body{font-size:14px}.site-header{padding:21px 16px 20px;gap:10px}.brand{gap:10px}.brand-mark{width:39px;height:39px;border-radius:10px;font-size:25px}.eyebrow{font-size:9px}h1{font-size:21px}.header-tools{gap:8px}.theme-label select{font-size:10px;padding:7px 22px 7px 8px;max-width:110px}.app-layout{padding:17px 14px 35px}.filter-summary-hint{font-size:9px}.filter-body{grid-template-columns:1fr;padding:3px 16px 16px;gap:12px}.filter-field{display:grid;grid-template-columns:40px minmax(0,1fr);align-items:center}.filter-field select{font-size:13px;min-height:42px}.filter-field label{font-size:11px}.search-panel{padding:16px;border-radius:11px}.search-title-row{margin-bottom:12px}.search-title-row h2{font-size:14px}.shortcut-hint{display:none}.search-row input{height:47px;font-size:16px;padding-left:11px}.search-options{margin-top:10px;gap:5px}.scope-label{font-size:10px;gap:4px}.scope-label select{font-size:10px;padding-right:17px}.search-help{font-size:9px}.content-summary{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;padding:0 4px;margin:18px 0 20px}.summary-cell{gap:10px;border-right:0}.summary-cell:nth-child(odd){border-right:1px solid var(--line)}.summary-count{min-width:34px;font-size:22px}.summary-cell small{font-size:9px}.results-toolbar{margin-bottom:12px;gap:10px}.global-answer-button{font-size:11px}.topic{padding:19px 17px 17px;border-radius:11px;margin-bottom:14px}.question-head{gap:8px;align-items:flex-start}.question-ident{gap:7px}.answer-source{font-size:9px;max-width:90px;text-align:right;white-space:normal;line-height:1.8}.question-number{font-size:11px}.type-pill{font-size:10px}.difficulty{font-size:10px}.question-meta{font-size:10px;margin-bottom:16px}.detail-box{font-size:14px;line-height:1.9}.detail-box pre{font-size:12px;padding:11px 12px}.extraction-warning{flex-direction:column;gap:3px;padding:11px 12px;font-size:11px}.answer-content{font-size:13px}.code-box{font-size:12px;padding:42px 13px 14px;max-height:55vh}.answer-heading{font-size:10px}.code-language{left:14px}.copy-btn{font-size:10px}.answer-section{margin-top:18px}.answer-caption,.answer-toggle{font-size:11px}.empty-state{padding:40px 17px}.empty-title{font-size:17px}.empty-state>p:not(.empty-title){font-size:12px}.viewer-footer{font-size:10px;padding:14px 10px}#back-to-top{bottom:15px;right:14px;font-size:10px;padding:8px 10px}}
         .image-integrity{margin:-6px 0 20px;padding:10px 13px;border:1px solid var(--line);border-radius:7px;color:var(--muted);background:var(--surface);font-size:11px;line-height:1.8}.image-integrity.integrity-warning,.question-image-warning{color:var(--warning);background:var(--warning-bg);border:1px solid var(--warning-line)}.question-image-warning{margin-top:15px;padding:10px 13px;border-radius:7px;font-size:11px;line-height:1.8}.code-box code{font:inherit}.source-image-unavailable strong{display:block;margin-bottom:5px}.source-image-unavailable a{display:inline-block;margin-top:7px}
         @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
-        @media print{body{background:white;color:black}.site-header{padding:0 0 15px}.sidebar,.search-panel,.results-toolbar,.header-tools,.answer-toggle,.copy-btn,#back-to-top,.skip-link{display:none!important}.app-layout{display:block;padding:15px 0}.content-summary{margin:0 0 20px}.topic{contain:none;box-shadow:none;break-inside:avoid;border-color:#aaa}.code-box{max-height:none;overflow:visible}.viewer-footer{color:#333}}
+        @media print{body{background:white;color:black}.site-header{padding:0 0 15px}.sidebar,.search-panel,.results-toolbar,.header-tools,.answer-toggle,.copy-btn,#back-to-top,.skip-link{display:none!important}.app-layout{display:block;padding:15px 0}.workspace{padding-bottom:0}.content-summary{margin:0 0 20px}.topic{contain:none;box-shadow:none;break-inside:avoid;border-color:#aaa}.code-box{max-height:none;overflow:visible}.viewer-footer{color:#333}}
         `;
     }
 

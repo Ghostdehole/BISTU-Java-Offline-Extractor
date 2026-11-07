@@ -20,6 +20,7 @@ function instrument(source) {
       requestDeepSeek: typeof requestDeepSeek === 'function' ? requestDeepSeek : undefined,
       restorePlatformVariables: typeof restorePlatformVariables === 'function' ? restorePlatformVariables : undefined,
       validateImageBuffer: typeof validateImageBuffer === 'function' ? validateImageBuffer : undefined,
+      getImageDimensions: buffer => typeof imageDimensions !== 'undefined' ? imageDimensions.get(buffer) : undefined,
       get state() { return globalState; },
       get data() { return allData; },
       get images() { return imageQueue; },
