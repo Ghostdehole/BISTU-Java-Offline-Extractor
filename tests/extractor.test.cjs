@@ -161,11 +161,12 @@ test('pause ZIP then final ZIP both retain identical image bytes and extraction 
     assert.equal(zip.state.globalState.scope.search, 'scope keyword');
     assert.equal(zip.state.globalState.scope.chapter, 'synthetic-chapter');
     assert.equal(zip.state.globalState.scope.degree, '2,3');
-    assert.equal(zip.report.exporterVersion, '7.10.1');
-    assert.equal(zip.report.source.version, '7.10.1');
+    assert.equal(zip.report.exporterVersion, require('../package.json').version);
+    assert.equal(zip.report.source.version, require('../package.json').version);
     assert.equal(zip.report.totalQuestions, 2);
     assert.equal(zip.report.duplicateIds, 0);
-    assert.deepEqual(zip.report.images, { expected: 1, included: 1, failed: 0 });
+    assert.deepEqual(zip.report.images, { expected: 1, included: 1, failed: 0, sourceUnavailable: 0, pending: 0, missingAtSource: [] });
+    assert.equal(zip.report.imagesComplete, true);
     assert.equal(zip.report.byType.find(row => row.type === 'Single').expected, 1);
     assert.equal(zip.report.byType.find(row => row.type === 'Single').verifiedAnswers, 1);
     assert.equal(zip.report.byType.find(row => row.type === 'Program').referencePrograms, 1);
@@ -330,16 +331,17 @@ test('a previously failed image is downloaded again on resume', () => withPage(a
     __test.state.stage = 4;
     __test.setImages([['http://fixture.test/retry.png', { filename: 'img_1.png', downloaded: false, failed: true, buffer: null }]]);
     let requests = 0;
-    window.__fetch = async () => { requests++; return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'Content-Type': 'image/png' } }); };
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
+    window.__fetch = async () => { requests++; return new Response(png, { status: 200, headers: { 'Content-Type': 'image/png' } }); };
     await __test.runStage4();
     const image = __test.images.values().next().value;
-    return { requests, stage: __test.state.stage, downloaded: image.downloaded, failed: image.failed, bytes: image.buffer?.byteLength };
+    return { requests, stage: __test.state.stage, downloaded: image.downloaded, failed: image.failed, bytes: image.buffer?.byteLength, expectedBytes: png.byteLength };
   });
   assert.equal(actual.requests, 1);
   assert.equal(actual.stage, 5);
   assert.equal(actual.downloaded, true);
   assert.equal(actual.failed, false);
-  assert.equal(actual.bytes, 3);
+  assert.equal(actual.bytes, actual.expectedBytes);
 }));
 
 test('unpacked file:// export loads local images and works in a narrow viewport with all HTTP blocked', () => withPage(async sourcePage => {
@@ -362,6 +364,7 @@ test('unpacked file:// export loads local images and works in a narrow viewport 
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(pathToFileURL(path.join(folder, 'index.html')).href);
     await page.waitForFunction(() => document.querySelector('.detail-box img').naturalWidth === 1);
+    if (await page.locator('#filterDetails').count() && await page.locator('#filterDetails').getAttribute('open') === null) await page.locator('#filterDetails > summary').click();
     await page.locator('#sourceFilter').selectOption({ label: 'Second chapter' });
     await page.waitForFunction(() => document.getElementById('visibleCount').textContent === '1');
     assert.match(await page.locator('.topic:not(.hidden)').innerText(), /Beta local fixture/);
@@ -471,7 +474,7 @@ test('empty-options exceptions still reject mismatched, incomplete and login pag
 
 test('Program PlainExample is retained verbatim as an unverified platform reference without AI calls', () => withPage(async page => {
   const result = await page.evaluate(async () => {
-    const code = 'class Fixture {\n  String s = "&lt;literal&gt; &amp; <img src=\\"remote.png\\">";\n  boolean less = 1 < 2 && 2 > 1;\n}';
+    const code = '\r\nclass Fixture {\r\n  String s = "&lt;literal&gt; &amp; <img src=\\"remote.png\\">";\r\n  boolean less = 1 < 2 && 2 > 1;\r\n}\r\n';
     __test.state.stage = 2;
     __test.keyManager.updateKeys('synthetic-test-key');
     __test.setData([{ GlobalUID: 0, TopicGuid: 'synthetic-program', QuestionType: 'Program', Title: '<p>Program fixture</p>', Requirement: '<p>Keep exact output</p>', PlainExample: code, s2_done: false, s3_done: false }]);
@@ -491,8 +494,12 @@ test('Program PlainExample is retained verbatim as an unverified platform refere
   assert.match(await page.locator('.reference-answer').innerText(), /平台返回的参考程序（未运行验证）/);
   assert.equal(await page.locator('.reference-answer .code-box').textContent(), result.code);
   assert.equal(await page.locator('.reference-answer img').count(), 0);
-  await page.evaluate(() => { document.execCommand = command => { if (command === 'copy') window.__copiedReference = document.querySelector('textarea').value; return true; }; });
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { window.__copiedReference = text; } } });
+    document.execCommand = command => { if (command === 'copy') window.__copiedReference = document.querySelector('textarea').value; return true; };
+  });
   await page.locator('.reference-answer .copy-btn').click();
+  await page.waitForFunction(() => window.__copiedReference !== undefined);
   assert.equal(await page.evaluate(() => window.__copiedReference), result.code);
 }));
 
@@ -641,4 +648,523 @@ test('legacy scan without stored type definitions cannot resume after menu order
     });
   });
   assert.deepEqual(actual, [true, true, true]);
+}));
+
+test('import re-fetches untrusted completed objective details while retaining matching modern placeholders', () => withPage(async page => {
+  await page.evaluate(() => {
+    __test.setEngineStage(2, async () => { window.__objectiveRows = __test.data; window.__objectiveStage = __test.state.stage; __test.state.isPaused = true; });
+    __test.setBuilder(async () => { window.__objectiveImportFinished = true; });
+  });
+  const state = snapshot();
+  state.globalState.stage = 5;
+  state.globalState.version = '7.9';
+  const base = { QuestionType: 'Single', Title: 'Synthetic statement', s2_done: true, s3_done: true };
+  const placeholder = { ...base, Title: 'Synthetic skipped item', SniffedAnswer: '', AnswerSource: null, IsAIAnswer: false, NeedsAI: false,
+    ExtractionWarning: '平台本题未提供选项，已保留原文；无可验证的答案。',
+    DetailHtml: '<div class="panel panel-default"><div class="panel-heading">单选题练习</div><div class="panel-body">Synthetic skipped item</div><ul class="list-group"></ul></div>' };
+  state.allData = [
+    { ...base, GlobalUID: 0, TopicGuid: 'old-network-error', DetailHtml: '<div>详情页抓取失败，原题丢失。</div>', SniffedAnswer: 'Untrusted cached answer', IsAIAnswer: true, NeedsAI: true },
+    { ...base, GlobalUID: 1, TopicGuid: 'arbitrary-warning', DetailHtml: '<p>Not a practice detail</p>', ExtractionWarning: 'Trust me', NeedsAI: false },
+    { ...base, GlobalUID: 2, TopicGuid: 'valid-options', DetailHtml: '<label><input type="radio" value="A">Original option A</label>', SniffedAnswer: 'Original option A', AnswerSource: 'platform-verified', IsAIAnswer: false, NeedsAI: false },
+    { ...placeholder, GlobalUID: 3, TopicGuid: 'valid-placeholder' },
+    { ...placeholder, GlobalUID: 4, TopicGuid: 'mismatched-placeholder', Title: 'Different statement' },
+    { ...base, GlobalUID: 5, TopicGuid: 'login-with-options', DetailHtml: '<input type="password"><label><input type="radio">Remember login</label>' }
+  ];
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => window.__objectiveImportFinished);
+  const actual = await page.evaluate(() => ({ rows: __objectiveRows, stage: __objectiveStage }));
+  assert.equal(actual.stage, 2);
+  for (const index of [0, 1, 4, 5]) {
+    assert.equal(actual.rows[index].s2_done, false, 'untrusted detail ' + index);
+    assert.equal(actual.rows[index].s3_done, false);
+    for (const field of ['DetailHtml', 'SniffedAnswer', 'AnswerSource', 'IsAIAnswer', 'NeedsAI', 'ExtractionWarning']) assert.equal(Object.hasOwn(actual.rows[index], field), false, field);
+  }
+  assert.equal(actual.rows[2].s2_done, true);
+  assert.equal(actual.rows[2].SniffedAnswer, 'Original option A');
+  assert.equal(actual.rows[3].s2_done, true);
+  assert.equal(actual.rows[3].ExtractionWarning, placeholder.ExtractionWarning);
+}));
+
+test('import of verified choice and matching placeholder does not repeat answer submissions', () => withPage(async page => {
+  const state = snapshot();
+  state.globalState.stage = 5;
+  state.allData = [
+    { GlobalUID: 0, TopicGuid: 'verified-choice', QuestionType: 'Single', Title: 'Verified synthetic choice', DetailHtml: '<label><input type="radio" value="A">Choice A</label>', SniffedAnswer: 'Choice A', AnswerSource: 'platform-verified', IsAIAnswer: false, NeedsAI: false, s2_done: true, s3_done: true },
+    { GlobalUID: 1, TopicGuid: 'verified-placeholder', QuestionType: 'Single', Title: 'Skipped fixture', DetailHtml: '<div class="panel"><div class="panel-heading">单选题练习</div><div class="panel-body">Skipped fixture</div><ul class="list-group"></ul></div>', SniffedAnswer: '', AnswerSource: null, IsAIAnswer: false, NeedsAI: false, s2_done: true, s3_done: false, ExtractionWarning: '平台本题未提供选项，已保留原文；无可验证的答案。' }
+  ];
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => window.__zips.length > 0);
+  const actual = await page.evaluate(async () => ({ calls: __ajaxCalls.length, stage: __test.state.stage, report: JSON.parse(await __zips[0].file('extraction-report.json').async('string')) }));
+  assert.equal(actual.calls, 0);
+  assert.equal(actual.stage, 5);
+  assert.equal(actual.report.complete, true);
+  assert.equal(actual.report.byType.find(row => row.type === 'Single').details, 2);
+  assert.equal(actual.report.byType.find(row => row.type === 'Single').platformContentNotices, 1);
+}));
+
+test('image validation decodes real PNG and SVG bytes and rejects nonempty corrupted image data', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0)).buffer;
+    const svg = new TextEncoder().encode('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="2" height="3"><rect width="2" height="3" fill="red"/></svg>').buffer;
+    const originalCreate = URL.createObjectURL, originalRevoke = URL.revokeObjectURL;
+    const created = [], revoked = [];
+    URL.createObjectURL = blob => { const url = originalCreate.call(URL, blob); created.push(url); return url; };
+    URL.revokeObjectURL = url => { revoked.push(url); return originalRevoke.call(URL, url); };
+    try {
+      const pngValid = await __test.validateImageBuffer(png, 'image/png') === png;
+      const svgValid = await __test.validateImageBuffer(svg) === svg;
+      let corruptError;
+      try { await __test.validateImageBuffer(new Uint8Array([1, 2, 3]).buffer, 'image/png'); } catch (error) { corruptError = error.message; }
+      return { pngValid, svgValid, corruptError, allUrlsRevoked: created.length === 3 && created.every(url => revoked.includes(url)) };
+    } finally { URL.createObjectURL = originalCreate; URL.revokeObjectURL = originalRevoke; }
+  });
+  assert.equal(result.pngValid, true);
+  assert.equal(result.svgValid, true);
+  assert.match(result.corruptError, /无法解码/);
+  assert.equal(result.allUrlsRevoked, true);
+}));
+
+test('image decode timeout rejects and releases its object URL', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    const OriginalImage = window.Image, originalRevoke = URL.revokeObjectURL;
+    let revoked = 0, removed = 0;
+    window.Image = function() { return { naturalWidth: 0, naturalHeight: 0, removeAttribute() { removed++; } }; };
+    URL.revokeObjectURL = url => { revoked++; return originalRevoke.call(URL, url); };
+    try {
+      let message;
+      try { await __test.validateImageBuffer(new Uint8Array([1]).buffer, 'image/png', 15); } catch (error) { message = error.message; }
+      return { message, revoked, removed };
+    } finally { window.Image = OriginalImage; URL.revokeObjectURL = originalRevoke; }
+  });
+  assert.match(result.message, /解码超时/);
+  assert.equal(result.revoked, 1);
+  assert.equal(result.removed, 1);
+}));
+
+test('nonempty corrupt image responses pause download instead of reporting completion', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 4;
+    __test.setImages([['http://fixture.test/corrupt.png', { filename: 'img_1.png', downloaded: false, failed: false, buffer: null }]]);
+    let attempts = 0;
+    __fetch = async () => { attempts++; return new Response(new Uint8Array([1,2,3]), { status: 200, headers: { 'Content-Type': 'image/png' } }); };
+    await __test.runStage4();
+    const image = __test.images.values().next().value;
+    return { attempts, stage: __test.state.stage, paused: __test.state.isPaused, downloaded: image.downloaded, failed: image.failed, buffer: image.buffer };
+  });
+  assert.equal(result.attempts, 3);
+  assert.equal(result.stage, 4);
+  assert.equal(result.paused, true);
+  assert.equal(result.downloaded, false);
+  assert.equal(result.failed, true);
+  assert.equal(result.buffer, null);
+}));
+
+test('snapshot import keeps decodable images and retries only corrupt archived bytes', () => withPage(async page => {
+  await page.evaluate(() => {
+    __test.setEngineStage(4, async () => {
+      window.__decodedImport = Array.from(__test.images.values()).map(image => ({ filename: image.filename, downloaded: image.downloaded, failed: image.failed, bytes: image.buffer?.byteLength || 0 }));
+      __test.state.isPaused = true;
+    });
+    __test.setBuilder(async () => { window.__decodedImportFinished = true; });
+  });
+  const state = snapshot();
+  state.globalState.stage = 5;
+  state.imgCounter = 3;
+  state.imageQueueList = [
+    ['http://fixture.test/good.png', { filename: 'img_1.png', downloaded: true, failed: false }],
+    ['http://fixture.test/corrupt.png', { filename: 'img_2.png', downloaded: true, failed: false }]
+  ];
+  const zip = new JSZip();
+  zip.file('state.json', JSON.stringify(state));
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=', 'base64');
+  zip.file('images/img_1.png', png);
+  zip.file('images/img_2.png', Buffer.from([1,2,3]));
+  await page.locator('#bistu-file-input').setInputFiles({ name: 'synthetic-images.zip', mimeType: 'application/zip', buffer: await zip.generateAsync({ type: 'nodebuffer' }) });
+  await page.waitForFunction(() => window.__decodedImportFinished);
+  const actual = await page.evaluate(() => ({ images: __decodedImport, stage: __test.state.stage, requests: __ajaxCalls.length }));
+  assert.equal(actual.stage, 4);
+  assert.deepEqual(actual.images[0], { filename: 'img_1.png', downloaded: true, failed: false, bytes: png.byteLength });
+  assert.deepEqual(actual.images[1], { filename: 'img_2.png', downloaded: false, failed: false, bytes: 0 });
+  assert.equal(actual.requests, 0);
+}));
+
+test('confirmed 404 and 410 images retain source metadata while later downloads complete', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 4;
+    __test.setImages([
+      ['http://fixture.test/missing.png', { filename: 'img_1.png', buffer: null, downloaded: false, failed: false, alt: 'Synthetic missing diagram' }],
+      ['http://fixture.test/gone.png', { filename: 'img_2.png', buffer: null, downloaded: false, failed: false, alt: 'Synthetic removed diagram' }],
+      ['http://fixture.test/good.png', { filename: 'img_3.png', buffer: null, downloaded: false, failed: false }]
+    ]);
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
+    const attempts = {};
+    __fetch = async url => {
+      attempts[url] = (attempts[url] || 0) + 1;
+      if (url.includes('missing')) return new Response('', { status: 404 });
+      if (url.includes('gone')) return new Response('', { status: 410 });
+      return new Response(png, { status: 200, headers: { 'Content-Type': 'image/png' } });
+    };
+    await __test.runStage4();
+    await __test.buildZipAndDownload(true);
+    return { stage: __test.state.stage, paused: __test.state.isPaused, attempts,
+      report: JSON.parse(await __zips[0].file('extraction-report.json').async('string')),
+      state: JSON.parse(await __zips[0].file('state.json').async('string')),
+      archivedImages: Object.keys(__zips[0].files).filter(name => /^images\/img_/.test(name)) };
+  });
+  assert.equal(result.stage, 5);
+  assert.equal(result.paused, false);
+  assert.equal(result.attempts['http://fixture.test/missing.png'], 3);
+  assert.equal(result.attempts['http://fixture.test/gone.png'], 3);
+  assert.equal(result.report.complete, true);
+  assert.equal(result.report.imagesComplete, false);
+  assert.equal(result.report.images.expected, 3);
+  assert.equal(result.report.images.included, 1);
+  assert.equal(result.report.images.sourceUnavailable, 2);
+  assert.equal(result.report.images.failed, 0);
+  assert.equal(result.report.images.pending, 0);
+  assert.deepEqual(result.archivedImages, ['images/img_3.png']);
+  assert.deepEqual(result.report.images.missingAtSource.map(image => image.status), [404, 410]);
+  const missing = result.state.imageQueueList[0][1];
+  assert.equal(missing.sourceUnavailable, true);
+  assert.equal(missing.downloaded, false);
+  assert.equal(missing.failed, false);
+  assert.equal(missing.status, 404);
+  assert.equal(missing.originalUrl, 'http://fixture.test/missing.png');
+  assert.equal(missing.alt, 'Synthetic missing diagram');
+}));
+
+test('temporary image failures finish the bounded queue before pausing and mixed statuses are not permanent', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.state.stage = 4;
+    const names = ['mixed', 'server', 'corrupt', 'good1', 'good2', 'good3'];
+    __test.setImages(names.map((name, index) => [`http://fixture.test/${name}.png`, { filename: `img_${index + 1}.png`, buffer: null, downloaded: false, failed: false }]));
+    const valid = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
+    const attempts = {}; let active = 0, maxActive = 0;
+    __fetch = async url => {
+      attempts[url] = (attempts[url] || 0) + 1; active++; maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 15)); active--;
+      if (url.includes('mixed')) return new Response('', { status: attempts[url] === 2 ? 500 : 404 });
+      if (url.includes('server')) return new Response('', { status: 503 });
+      if (url.includes('corrupt')) return new Response(new Uint8Array([1,2,3]), { status: 200, headers: { 'Content-Type': 'image/png' } });
+      return new Response(valid, { status: 200, headers: { 'Content-Type': 'image/png' } });
+    };
+    await __test.runStage4();
+    await __test.buildZipAndDownload(false);
+    return { stage: __test.state.stage, paused: __test.state.isPaused, maxActive, attempts,
+      images: Array.from(__test.images.values()).map(image => ({ downloaded: image.downloaded, failed: image.failed, sourceUnavailable: image.sourceUnavailable, status: image.status })),
+      report: JSON.parse(await __zips[0].file('extraction-report.json').async('string')) };
+  });
+  assert.equal(result.stage, 4);
+  assert.equal(result.paused, true);
+  assert.equal(result.maxActive, 3);
+  assert.equal(Object.keys(result.attempts).length, 6, 'later images are attempted despite earlier failures');
+  assert.ok(result.images.slice(0, 3).every(image => image.failed && !image.sourceUnavailable && !image.downloaded));
+  assert.ok(result.images.slice(3).every(image => image.downloaded && !image.failed));
+  assert.equal(result.report.complete, false);
+  assert.equal(result.report.images.failed, 3);
+  assert.equal(result.report.images.included, 3);
+  assert.equal(result.report.images.pending, 0);
+  assert.deepEqual(result.report.images.missingAtSource, []);
+}));
+
+test('import remembers missing-source metadata but retries the URL and clears it after recovery', () => withPage(async page => {
+  await page.evaluate(() => {
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0));
+    window.__recoveredRequests = 0;
+    __fetch = async () => { __recoveredRequests++; return new Response(png, { status: 200, headers: { 'Content-Type': 'image/png' } }); };
+  });
+  const state = snapshot();
+  state.globalState.stage = 5; state.imgCounter = 2;
+  state.imageQueueList = [['http://fixture.test/recovered.png', { filename: 'img_1.png', downloaded: false, failed: false, sourceUnavailable: true, status: 404, originalUrl: 'http://fixture.test/recovered.png', alt: 'Recovered synthetic diagram' }]];
+  await uploadSnapshot(page, state);
+  await page.waitForFunction(() => __zips.length > 0);
+  const actual = await page.evaluate(async () => ({ requests: __recoveredRequests, image: { ...__test.images.values().next().value, buffer: undefined }, report: JSON.parse(await __zips[0].file('extraction-report.json').async('string')) }));
+  assert.equal(actual.requests, 1);
+  assert.equal(actual.image.downloaded, true);
+  assert.equal(actual.image.sourceUnavailable, false);
+  assert.equal(actual.image.status, null);
+  assert.equal(actual.image.alt, 'Recovered synthetic diagram');
+  assert.equal(actual.report.complete, true);
+  assert.equal(actual.report.imagesComplete, true);
+  assert.equal(actual.report.images.sourceUnavailable, 0);
+}));
+test('scope preflight refuses missing filters or unavailable chapters without widening the query', () => withPage(async page => {
+  const result = await page.evaluate(() => {
+    const failures = [];
+    const beforeScope = JSON.stringify(__test.state.scope);
+    for (const selector of ['#select_DegreeLevel', '#select_KnoGuid', '#input_Search', '#ul_Tree']) {
+      const element = document.querySelector(selector);
+      const next = element.nextSibling;
+      const parent = element.parentNode;
+      element.remove();
+      let error;
+      try { __test.initializePlatformVariables(); } catch (e) { error = e.message; }
+      failures.push({ name: selector, error, scopeUnchanged: JSON.stringify(__test.state.scope) === beforeScope });
+      parent.insertBefore(element, next);
+    }
+    const originalTree = $.fn.zTree.getZTreeObj;
+    for (const [name, getter] of [
+      ['not initialized', () => null],
+      ['read failure', () => ({ getSelectedNodes: () => { throw new Error('Unavailable'); } })],
+      ['missing selection', () => ({ getSelectedNodes: () => null })],
+      ['invalid chapter', () => ({ getSelectedNodes: () => [{}] })]
+    ]) {
+      $.fn.zTree.getZTreeObj = getter;
+      let error;
+      try { __test.initializePlatformVariables(); } catch (e) { error = e.message; }
+      failures.push({ name, error, scopeUnchanged: JSON.stringify(__test.state.scope) === beforeScope });
+    }
+    $.fn.zTree.getZTreeObj = originalTree;
+    __values['#select_LanguageType'] = undefined;
+    __chapters = [];
+    __test.initializePlatformVariables();
+    return { failures, scope: __test.state.scope, requests: __ajaxCalls.length, hasLanguageControl: !!document.querySelector('#select_LanguageType') };
+  });
+  for (const failure of result.failures) {
+    assert.ok(failure.error, failure.name);
+    assert.equal(failure.scopeUnchanged, true, failure.name);
+  }
+  assert.equal(result.requests, 0);
+  assert.equal(result.hasLanguageControl, false);
+  assert.equal(result.scope.language, 'Java');
+  assert.equal(result.scope.chapter, '');
+}));
+
+test('lazy images, srcset-only images and matching picture sources become local image files', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'responsive-images', QuestionType: 'Program', Title: '<p>Responsive image fixtures</p><img data-src="/lazy.png" src="/placeholder.png"><img srcset="/small.png 1x, /large.png?crop=1,2 2x"><picture><source media="(max-width: 1px)" srcset="/not-matching.png 1x"><source type="image/webp" srcset="/picture-small.webp 640w, /picture-large.webp 1280w"><img src="/fallback.png"></picture>', Requirement: '', PlainExample: 'class Images {}', s2_done: false, imgUrls: [] }]);
+    await __test.runStage2();
+    const detail = new DOMParser().parseFromString(__test.data[0].DetailHtml, 'text/html');
+    return { row: __test.data[0], urls: Array.from(__test.images.keys()), sources: Array.from(detail.querySelectorAll('img'), image => image.getAttribute('src')), onlineOverrides: detail.querySelectorAll('[srcset], [data-src], [data-srcset], picture > source').length, paused: __test.state.isPaused };
+  });
+  assert.equal(result.paused, false);
+  assert.equal(result.row.s2_done, true);
+  assert.deepEqual(result.urls, ['http://fixture.test/lazy.png', 'http://fixture.test/large.png?crop=1,2', 'http://fixture.test/picture-large.webp']);
+  assert.equal(result.sources.length, 3);
+  for (const src of result.sources) assert.match(src, /^images\/img_\d+\.(?:png|webp)$/);
+  assert.equal(result.onlineOverrides, 0);
+}));
+
+test('unsupported visible rich resources pause extraction instead of claiming complete fidelity', () => withPage(async page => {
+  const results = await page.evaluate(async () => {
+    const cases = [
+      ['inline SVG', '<svg width="10" height="10"><text>Meaningful graph</text></svg>'],
+      ['MathML', '<math><mi>x</mi><mo>+</mo><mn>1</mn></math>'],
+      ['video', '<video><source src=""><source src="/lecture.mp4"></video>'],
+      ['audio', '<audio src="/sound.wav"></audio>'],
+      ['embedded document', '<iframe src="/document.html"></iframe>'],
+      ['file attachment', '<a href="/material.pdf">PDF attachment</a>'],
+      ['download attachment', '<a href="/Download?id=fixture" download>Download attachment</a>'],
+      ['background image', '<div style="background-image:url(/graph.png)">Graph description</div>'],
+      ['legacy background image', '<table background="/graph.png"><tr><td>Graph</td></tr></table>'],
+      ['ambiguous srcset', '<img srcset="/first.png 1x, /second.png 600w">']
+    ];
+    const results = [];
+    for (const [name, content] of cases) {
+      __test.state.isPaused = false; __test.state.stage = 2; delete __test.state.lastError;
+      __test.setImages([]);
+      __test.setData([{ GlobalUID: 0, TopicGuid: 'unsupported-resource', QuestionType: 'Program', Title: '<p>Synthetic question</p>' + content, PlainExample: 'class Unsupported {}', s2_done: false, imgUrls: [] }]);
+      await __test.runStage2();
+      results.push({ name, paused: __test.state.isPaused, done: __test.data[0].s2_done, error: __test.state.lastError, stage: __test.state.stage });
+    }
+    return results;
+  });
+  for (const result of results) {
+    assert.equal(result.paused, true, result.name);
+    assert.equal(result.done, false, result.name);
+    assert.equal(result.stage, 2, result.name);
+    assert.ok(result.error, result.name);
+  }
+}));
+
+test('ordinary styles, empty media and hidden illustrations do not trigger unsupported-resource errors or execute scripts', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'ordinary-rich-text', QuestionType: 'Program', Title: '<p style="background-color: red">Ordinary text</p><div hidden><svg><text>Hidden illustration</text></svg></div><video></video><img><script>window.__questionScriptExecuted = true;</script><a href="https://example.test/documentation">Documentation</a>', PlainExample: 'class Safe {}', s2_done: false, imgUrls: [] }]);
+    await __test.runStage2();
+    return { done: __test.data[0].s2_done, paused: __test.state.isPaused, scriptExecuted: !!window.__questionScriptExecuted, imageCount: __test.images.size };
+  });
+  assert.equal(result.done, true);
+  assert.equal(result.paused, false);
+  assert.equal(result.scriptExecuted, false);
+  assert.equal(result.imageCount, 0);
+}));
+
+test('when every official option is rejected, preserve the options and explicit warning without fabricating an answer', () => withPage(async page => {
+  const result = await page.evaluate(async () => {
+    __test.setData([{ GlobalUID: 0, TopicGuid: 'no-correct-option', QuestionType: 'Single', Title: 'Synthetic inconsistent platform question', s2_done: false, imgUrls: [] }]);
+    __respond = ({ url }) => url.includes('JumpToPracticeTopic') ? '<form><h2>Synthetic inconsistent platform question</h2><label><input type="radio" value="A">Option A</label><label><input type="radio" value="B">Option B</label><label><input type="radio" value="C">Option C</label></form>' : { Result: false };
+    await __test.runStage2();
+    const html = __test.generateOfflineHtml(false);
+    return { row: __test.data[0], posts: __ajaxCalls.filter(call => call.method === 'post').length, optionCount: new DOMParser().parseFromString(html, 'text/html').querySelectorAll('.detail-box input[type="radio"]').length, warning: new DOMParser().parseFromString(html, 'text/html').querySelector('.extraction-warning')?.textContent };
+  });
+  assert.equal(result.row.s2_done, true);
+  assert.equal(result.posts, 3);
+  assert.equal(result.optionCount, 3);
+  assert.equal(result.row.SniffedAnswer, '');
+  assert.equal(result.row.AnswerSource, null);
+  assert.equal(result.row.IsAIAnswer, false);
+  assert.equal(result.row.NeedsAI, true);
+  assert.match(result.row.ExtractionWarning, /平台|选项/);
+  assert.ok(result.warning.includes(result.row.ExtractionWarning));
+}));
+
+
+function studyFixture() {
+  return [
+    { QuestionType: 'Single', ChapterName: '基础', DegreeLevel: '简单', DetailHtml: '<p>Alpha Java contents</p>', SniffedAnswer: 'Synthetic first answer' },
+    { QuestionType: 'Multiple', ChapterName: '数组', DegreeLevel: '中等', DetailHtml: '<p>Alpha beta array exercise</p>', SniffedAnswer: 'A、B' },
+    { QuestionType: 'TrueOrFalse', ChapterName: '基础', DegreeLevel: '简单', DetailHtml: '<p>ＡＢＣ Ｊａｖａ Unicode fixture</p>', SniffedAnswer: '正确' },
+    { QuestionType: 'Program', ChapterName: '数组', DegreeLevel: '中等', DetailHtml: '<p>Program fixture</p>', SniffedAnswer: '\r\nclass Fixture {\r\n    String answerOnlyToken = "&lt;tag&gt; &amp; <literal>";\r\n}\r\n', AnswerSource: 'platform-reference' },
+    { QuestionType: 'Blank', ChapterName: '字符串', DegreeLevel: '困难', DetailHtml: '<p>Blank fixture</p>', SniffedAnswer: 'aiOnlyToken', IsAIAnswer: true },
+    { QuestionType: 'Single', ChapterName: '缺项', DegreeLevel: '无', DetailHtml: '<p>Placeholder fixture</p>', ExtractionWarning: 'Synthetic missing options' }
+  ].map((item, index) => ({ GlobalUID: index, TopicGuid: 'study-fixture-' + index, s2_done: true, IsAIAnswer: false, ...item }));
+}
+
+async function renderStudyFixture(page, fixture = studyFixture()) {
+  const html = await page.evaluate(data => { __test.setData(data); return __test.generateOfflineHtml(true); }, fixture);
+  await page.setContent(html);
+}
+
+async function studyQuery(page, query, count) {
+  await page.locator('#keywordFilter').fill(query);
+  await page.waitForTimeout(180); // Exercise the 150 ms debounce, including successive same-count queries.
+  await page.waitForFunction(expected => document.querySelector('#visibleCount').textContent === String(expected), count);
+}
+
+test('study search normalizes Unicode, ANDs tokens, switches prompt scope and resets filters', () => withPage(async page => {
+  await renderStudyFixture(page);
+  await studyQuery(page, '  abc   JAVA  ', 1);
+  assert.equal(await page.locator('.topic:not(.hidden)').getAttribute('data-type'), 'TrueOrFalse');
+  await studyQuery(page, 'alpha beta', 1);
+  assert.equal(await page.locator('.topic:not(.hidden)').getAttribute('data-type'), 'Multiple');
+  await studyQuery(page, 'answerOnlyToken', 1);
+  await page.locator('#searchScope').selectOption('prompt');
+  assert.equal(await page.locator('#visibleCount').textContent(), '0');
+  assert.equal(await page.locator('#emptyState').isVisible(), true);
+  await page.locator('#searchScope').selectOption('full');
+  assert.equal(await page.locator('#visibleCount').textContent(), '1');
+  await page.locator('#sourceFilter').selectOption('数组');
+  await page.locator('#clearSearch').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '2');
+  await page.locator('#typeFilter').selectOption('Program');
+  assert.equal(await page.locator('#visibleCount').textContent(), '1');
+  await page.locator('#diffFilter').selectOption('困难');
+  assert.equal(await page.locator('#visibleCount').textContent(), '0');
+  await page.locator('.empty-reset').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '6');
+  for (const selector of ['#sourceFilter', '#typeFilter', '#diffFilter']) assert.equal(await page.locator(selector).inputValue(), 'all');
+  assert.equal(await page.locator('#searchScope').inputValue(), 'full');
+  assert.equal(await page.locator('#emptyState').isVisible(), false);
+}));
+
+test('study keyboard shortcuts respect editable input and Chinese composition', () => withPage(async page => {
+  await renderStudyFixture(page);
+  await page.locator('h1').click(); await page.keyboard.press('/');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'keywordFilter');
+  await page.keyboard.type('alpha/');
+  assert.equal(await page.locator('#keywordFilter').inputValue(), 'alpha/');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#keywordFilter').inputValue(), '');
+  assert.equal(await page.locator('#visibleCount').textContent(), '6');
+  await page.locator('h1').click(); await page.keyboard.press('Control+k');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'keywordFilter');
+  await page.locator('#keywordFilter').evaluate(input => {
+    input.dispatchEvent(new CompositionEvent('compositionstart'));
+    input.value = '合成无匹配词';
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true }));
+  });
+  await page.waitForTimeout(220);
+  assert.equal(await page.locator('#visibleCount').textContent(), '6');
+  await page.locator('#keywordFilter').evaluate(input => input.dispatchEvent(new CompositionEvent('compositionend')));
+  assert.equal(await page.locator('#visibleCount').textContent(), '0');
+  await page.locator('#resetFilters').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '6');
+}));
+
+test('study per-question and global answer visibility stay synchronized without hiding warnings', () => withPage(async page => {
+  await renderStudyFixture(page);
+  await page.locator('#toggleAnsBtn').click();
+  assert.equal(await page.locator('.answer-box:not([hidden])').count(), 0);
+  assert.equal(await page.locator('.extraction-warning').isVisible(), true);
+  const local = page.locator('.answer-toggle').first();
+  assert.equal(await local.getAttribute('aria-expanded'), 'false');
+  await local.click();
+  assert.equal(await local.getAttribute('aria-expanded'), 'true');
+  assert.equal(await page.locator('.answer-box:not([hidden])').count(), 1);
+  assert.equal(await page.locator('#toggleAnsBtn').getAttribute('data-hidden'), 'false');
+  await page.locator('#toggleAnsBtn').click();
+  assert.equal(await page.locator('.answer-box:not([hidden])').count(), 0);
+  await studyQuery(page, 'answerOnlyToken', 1);
+  assert.equal(await page.locator('.reference-answer').isVisible(), false, 'search must not reveal hidden answers');
+  await page.locator('#resetFilters').click(); await page.locator('#toggleAnsBtn').click();
+  assert.equal(await page.locator('.answer-box:not([hidden])').count(), 5);
+}));
+
+test('program markup preserves leading and trailing LF, CRLF, CR and literal HTML entities', () => withPage(async page => {
+  const variants = ['\nclass LF {}\n', '\r\nclass CRLF {\r\n    String s = "&lt;literal&gt; &amp; <tag>";\r\n}\r\n', '\n\nclass TwoLF {}\n\n', '\rclass CR {}\r'];
+  const rendered = await page.evaluate(codes => {
+    __test.setData(codes.map((code, GlobalUID) => ({ GlobalUID, QuestionType: 'Program', DetailHtml: '<p>Code whitespace fixture</p>', SniffedAnswer: code, AnswerSource: 'platform-reference' })));
+    const doc = new DOMParser().parseFromString(__test.generateOfflineHtml(true), 'text/html');
+    return Array.from(doc.querySelectorAll('.code-box')).map(node => node.textContent);
+  }, variants);
+  assert.deepEqual(rendered, variants);
+}));
+
+test('cached study filtering retains DOM and answer state across 779 questions', () => withPage(async page => {
+  const fixture = studyFixture();
+  const data = Array.from({ length: 779 }, (_, index) => ({ ...fixture[index % fixture.length], GlobalUID: index, TopicGuid: 'large-study-fixture-' + index }));
+  await renderStudyFixture(page, data);
+  await page.evaluate(() => { window.__firstStudyCard = document.querySelector('.topic'); });
+  await page.locator('.answer-toggle').first().click();
+  await studyQuery(page, 'alpha beta', 130);
+  await page.locator('#clearSearch').click();
+  assert.equal(await page.locator('#visibleCount').textContent(), '779');
+  assert.equal(await page.evaluate(() => window.__firstStudyCard === document.querySelector('.topic')), true);
+  assert.equal(await page.locator('.answer-toggle').first().getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.locator('.topic').count(), 779);
+}));
+
+test('study layout supports mobile and desktop filters, both themes and no horizontal overflow', () => withPage(async page => {
+  await renderStudyFixture(page);
+  for (const width of [390, 768, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    if (width !== 768) await page.waitForFunction(wide => document.querySelector('#filterDetails').open === wide, width > 900);
+    const layout = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth, panelBottom: document.querySelector('#control-panel').getBoundingClientRect().bottom, firstQuestion: document.querySelector('.topic').getBoundingClientRect().top }));
+    assert.ok(layout.scroll <= width, JSON.stringify(layout));
+    assert.ok(layout.firstQuestion > layout.panelBottom, JSON.stringify(layout));
+    if (width <= 900) {
+      if (!(await page.locator('#filterDetails').evaluate(details => details.open))) await page.locator('#filterDetails summary').click();
+      assert.equal(await page.locator('#sourceFilter').isVisible(), true);
+      await page.locator('#sourceFilter').selectOption('数组');
+      assert.equal(await page.locator('#visibleCount').textContent(), '2');
+      await page.locator('#resetFilters').click();
+    }
+  }
+  await page.locator('#themeToggle').selectOption('dark');
+  assert.equal(await page.locator('body').evaluate(body => body.classList.contains('dark-mode')), true);
+  await page.locator('#themeToggle').selectOption('light');
+  assert.equal(await page.locator('body').evaluate(body => body.classList.contains('dark-mode')), false);
+}));
+
+test('source-unavailable image placeholders preserve explanations, metadata and manual links', () => withPage(async page => {
+  const html = await page.evaluate(() => {
+    const url = 'https://fixture.test/original-missing.png';
+    __test.setData([{ GlobalUID: 0, QuestionType: 'Single', DetailHtml: '<p>Missing picture fixture</p><img src="images/img_7.png" alt="literal &lt;alt&gt;" title="Original title" data-original="https://fixture.test/original-missing.png">', imgUrls: [url], SniffedAnswer: 'A' }]);
+    __test.setImages([[url, { filename: 'img_7.png', sourceUnavailable: true, status: 404, originalUrl: url, alt: 'backup alt', buffer: null, downloaded: false }]]);
+    return __test.generateOfflineHtml(true);
+  });
+  await page.setContent(html);
+  const placeholder = page.locator('.source-image-unavailable');
+  assert.equal(await placeholder.getAttribute('data-source-status'), '404');
+  assert.match(await placeholder.innerText(), /平台原图不可用（HTTP 404）/);
+  assert.match(await placeholder.innerText(), /literal <alt>/);
+  assert.match(await placeholder.innerText(), /Original title/);
+  assert.equal(await placeholder.locator('a').getAttribute('href'), 'https://fixture.test/original-missing.png');
+  assert.equal(await page.locator('img[src="images/img_7.png"]').count(), 0);
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-source-unavailable-count'), '1');
+  assert.equal(await page.locator('#extraction-summary').getAttribute('data-image-saved-count'), '0');
+  assert.match(await page.locator('.image-integrity').innerText(), /图像内容不完整/);
+  await page.locator('#toggleAnsBtn').click();
+  assert.equal(await page.locator('.question-image-warning').isVisible(), true);
+  assert.equal(await placeholder.isVisible(), true);
 }));

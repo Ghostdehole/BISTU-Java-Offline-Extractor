@@ -16,6 +16,7 @@ function instrument(source) {
       buildZipAndDownload, generateOfflineHtml, initializePlatformVariables,
       runWithConcurrency, keyManager,
       restorePlatformVariables: typeof restorePlatformVariables === 'function' ? restorePlatformVariables : undefined,
+      validateImageBuffer: typeof validateImageBuffer === 'function' ? validateImageBuffer : undefined,
       get state() { return globalState; },
       get data() { return allData; },
       get images() { return imageQueue; },
@@ -46,7 +47,7 @@ async function createHarness(browser, sourceOverride, fixtureHtml) {
   // Never use a real campus origin, cookies, course data, or an external AI API.
   await context.route('**/*', route => {
     if (route.request().url() === 'http://fixture.test/Manage/Practice/index') {
-      return route.fulfill({ contentType: 'text/html', body: fixtureHtml || '<!doctype html><html><head><meta charset="utf-8"></head><body><input id="input_Search"><select id="select_QuestionType"><option value="1">单选题</option><option value="2">多选题</option><option value="3">判断题</option><option value="4">填空题</option><option value="5">程序题</option></select></body></html>' });
+      return route.fulfill({ contentType: 'text/html', body: fixtureHtml || '<!doctype html><html><head><meta charset="utf-8"></head><body><input id="input_Search"><select id="select_DegreeLevel" multiple></select><select id="select_KnoGuid" multiple></select><ul id="ul_Tree"></ul><select id="select_QuestionType"><option value="1">单选题</option><option value="2">多选题</option><option value="3">判断题</option><option value="4">填空题</option><option value="5">程序题</option></select></body></html>' });
     }
     return route.abort('blockedbyclient');
   });
