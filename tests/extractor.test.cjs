@@ -2828,7 +2828,11 @@ test('phone drawer closes by button, Escape and backdrop with preserved controls
       await page.waitForFunction(()=>document.querySelector('#visibleCount').textContent==='50');
       if(method==='button') {
         await page.locator('#keywordFilter').evaluate(input=>input.dispatchEvent(new CompositionEvent('compositionstart')));
-        await page.keyboard.press('Escape');
+        // Synthetic events exercise the application's IME guard; a normal real
+        // Escape would invoke the search input's native clear action, not an IME.
+        await page.locator('#keywordFilter').evaluate(input=>{
+          for(const isComposing of [false,true]) input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true,isComposing}));
+        });
         assert.equal(await page.locator('#keywordFilter').inputValue(),'Synthetic drawer');
         assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
         const cancelled=await page.locator('#mobileDrawer').evaluate(drawer=>{const event=new Event('cancel',{cancelable:true});drawer.dispatchEvent(event);return event.defaultPrevented;});
