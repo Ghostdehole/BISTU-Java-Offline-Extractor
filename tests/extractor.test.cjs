@@ -16,10 +16,18 @@ async function withPage(fn) {
   try { return await fn(h.page); } finally { await h.close(); }
 }
 
+async function waitReaderControlsLayout(page) {
+  await page.waitForFunction(() => {
+    const sidebar=document.querySelector('#readerSidebar');
+    if(!sidebar) return false;
+    return matchMedia('(max-width:767px)').matches
+      ? sidebar.parentElement.id==='drawerContent'
+      : sidebar.parentElement.classList.contains('app-layout');
+  });
+}
+
 async function openReaderControls(page) {
-  if (page.viewportSize().width <= 767) {
-    await page.waitForFunction(() => document.querySelector('#readerSidebar').parentElement.id === 'drawerContent');
-  }
+  await waitReaderControlsLayout(page);
   if (page.viewportSize().width <= 767 && !await page.locator('#keywordFilter').isVisible()) {
     await page.locator('#mobileControls').click();
     await page.waitForFunction(() => document.querySelector('#mobileControls').getAttribute('aria-expanded') === 'true');
@@ -1162,7 +1170,7 @@ test('study controls stay unique and usable in the phone drawer and the tablet o
   await renderStudyFixture(page);
   for (const width of [390, 767, 768, 820, 1024, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
-    await page.waitForFunction(phone => document.querySelector('#mobileControls').getBoundingClientRect().width > 0 === phone, width <= 767);
+    await waitReaderControlsLayout(page);
     await openReaderControls(page);
     await page.evaluate(() => { document.querySelector('.sidebar').scrollTop = 0; });
     const layout = await page.evaluate(() => {
@@ -1503,7 +1511,7 @@ test('desktop sidebar stays reachable and deep phone search shortcuts open the d
   const data = Array.from({length:60},(_,GlobalUID)=>({GlobalUID,QuestionType:'Single',ChapterName:'Synthetic scroll chapter',DegreeLevel:'简单',DetailHtml:'<p>Synthetic long question.</p>'.repeat(5),SniffedAnswer:'Synthetic answer'}));
   await renderStudyFixture(page,data);await page.emulateMedia({reducedMotion:'reduce'});
   for(const width of [1440,768,820,390]) {
-    await page.setViewportSize({width,height:900});await closeReaderControls(page);
+    await page.setViewportSize({width,height:900});await waitReaderControlsLayout(page);await closeReaderControls(page);
     for(const shortcut of ['Control+k','/']) {
       await page.evaluate(()=>{document.activeElement.blur();document.querySelector('.sidebar').scrollTop=0;scrollTo({top:2400,behavior:'instant'});});
       await page.waitForFunction(()=>scrollY>1000);
@@ -1947,6 +1955,7 @@ test('narrow-screen prompt and answer images retain natural proportions despite 
   await page.waitForFunction(() => Array.from(document.querySelectorAll('.detail-box img,.answer-content img')).every(img => img.complete && img.naturalWidth === 1));
   for (const width of [390, 768]) {
     await page.setViewportSize({ width, height: 900 });
+    await waitReaderControlsLayout(page);
     const images = await page.locator('.detail-box img,.answer-content img').evaluateAll(nodes => nodes.map(img => {
       const rect = img.getBoundingClientRect();
       return { width: rect.width, height: rect.height, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight,
@@ -2580,6 +2589,7 @@ test('subjective questions inspect official details before AI and unresolved off
 }));
 
 async function settleReader(page) {
+  await waitReaderControlsLayout(page);
   await page.evaluate(async () => {
     await document.fonts.ready;
     for (let index=0;index<6;index++) await new Promise(requestAnimationFrame);
