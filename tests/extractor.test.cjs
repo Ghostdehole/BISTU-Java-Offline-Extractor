@@ -16,6 +16,31 @@ async function withPage(fn) {
   try { return await fn(h.page); } finally { await h.close(); }
 }
 
+async function waitReaderControlsLayout(page) {
+  await page.waitForFunction(() => {
+    const sidebar=document.querySelector('#readerSidebar');
+    if(!sidebar) return false;
+    return matchMedia('(max-width:767px)').matches
+      ? sidebar.parentElement.id==='drawerContent'
+      : sidebar.parentElement.classList.contains('app-layout');
+  });
+}
+
+async function openReaderControls(page) {
+  await waitReaderControlsLayout(page);
+  if (page.viewportSize().width <= 767 && !await page.locator('#keywordFilter').isVisible()) {
+    await page.locator('#mobileControls').click();
+    await page.waitForFunction(() => document.querySelector('#mobileControls').getAttribute('aria-expanded') === 'true');
+  }
+}
+
+async function closeReaderControls(page) {
+  if (page.viewportSize().width <= 767 && await page.locator('#drawerClose').isVisible()) {
+    await page.locator('#drawerClose').click();
+    await page.waitForFunction(() => document.querySelector('#mobileControls').getAttribute('aria-expanded') === 'false');
+  }
+}
+
 test('five question types: scans, preserves requirements, finds associated labels and exact answer values', () => withPage(async page => {
   const result = await page.evaluate(async () => {
     const types = ['Single', 'Multiple', 'TrueOrFalse', 'Blank', 'Program'];
@@ -367,15 +392,18 @@ test('unpacked file:// export loads local images and works in a narrow viewport 
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(pathToFileURL(path.join(folder, 'index.html')).href);
     await page.waitForFunction(() => document.querySelector('.detail-box img').naturalWidth === 1);
+    await openReaderControls(page);
     if (await page.locator('#filterDetails').count() && await page.locator('#filterDetails').getAttribute('open') === null) await page.locator('#filterDetails > summary').click();
     await page.locator('#chapterFilter').selectOption({ label: 'Second chapter' });
     await page.waitForFunction(() => document.getElementById('visibleCount').textContent === '1');
+    await closeReaderControls(page);
     await page.locator('.topic:not(.hidden)').scrollIntoViewIfNeeded();
     await page.waitForFunction(() => document.querySelector('.topic:not(.hidden)').innerText.includes('Beta local fixture'));
     assert.match(await page.locator('.topic:not(.hidden)').innerText(), /Beta local fixture/);
     assert.equal(await page.locator('.code-box').textContent(), 'String s = "&lt;literal&gt; &amp;";\nif (x < 2 && x > 0) {}');
-    const layout = await page.evaluate(() => ({ panelBottom: document.getElementById('control-panel').getBoundingClientRect().bottom, firstQuestion: document.querySelector('.topic:not(.hidden)').getBoundingClientRect().top, width: document.documentElement.scrollWidth, viewport: innerWidth }));
-    assert.ok(layout.firstQuestion >= layout.panelBottom, JSON.stringify(layout));
+    const layout = await page.evaluate(() => ({ width: document.documentElement.scrollWidth, viewport: innerWidth }));
+    assert.equal(await page.locator('#keywordFilter').isVisible(), false);
+    assert.equal(await page.locator('#mobileControls').isVisible(), true);
     assert.ok(layout.width <= layout.viewport, JSON.stringify(layout));
     assert.deepEqual(errors, []);
     assert.deepEqual(requests, []);
@@ -1138,13 +1166,13 @@ test('cached study filtering retains DOM and answer state across 779 questions',
   assert.equal(await page.locator('.topic').count(), 779);
 }));
 
-test('study search, result count and global answers stay in the sidebar outside mobile disclosure without overlap', () => withPage(async page => {
+test('study controls stay unique and usable in the phone drawer and the tablet or desktop sidebar', () => withPage(async page => {
   await renderStudyFixture(page);
-  for (const width of [390, 768, 1024, 1440]) {
+  for (const width of [390, 767, 768, 820, 1024, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
-    if (width !== 768) await page.waitForFunction(wide => document.querySelector('#filterDetails').open === wide, width > 900);
-    if (width <= 900 && await page.locator('#filterDetails').evaluate(details => details.open)) await page.locator('#filterDetails summary').click();
-    await page.evaluate(() => { window.scrollTo(0, 0); document.querySelector('.sidebar').scrollTop = 0; });
+    await waitReaderControlsLayout(page);
+    await openReaderControls(page);
+    await page.evaluate(() => { document.querySelector('.sidebar').scrollTop = 0; });
     const layout = await page.evaluate(() => {
       const sidebar = document.querySelector('.sidebar'), search = document.querySelector('#control-panel');
       const details = document.querySelector('#filterDetails'), workspace = document.querySelector('.workspace');
@@ -1153,47 +1181,26 @@ test('study search, result count and global answers stay in the sidebar outside 
       return { width: innerWidth, scroll: document.documentElement.scrollWidth,
         searchFirst: sidebar.firstElementChild === search, outsideDisclosure: !search.closest('details'),
         searchBottom: searchRect.bottom, searchRight: searchRect.right, filterTop: details.getBoundingClientRect().top,
-        workspaceLeft: workspaceRect.left, firstQuestion: document.querySelector('.topic').getBoundingClientRect().top,
-        resultInside: sidebar.contains(results) && sidebar.contains(toggle) && sidebar.contains(document.querySelector('#visibleCount')),
+        workspaceLeft: workspaceRect.left, resultInside: sidebar.contains(results) && sidebar.contains(toggle) && sidebar.contains(document.querySelector('#visibleCount')),
         resultsOutsideDisclosure: !results.closest('details'), resultTop: results.getBoundingClientRect().top, resultBottom: results.getBoundingClientRect().bottom,
-        uniqueControls: ['#resultStatus', '#visibleCount', '#toggleAnsBtn'].every(selector => document.querySelectorAll(selector).length === 1),
-        sidebarBottom: sidebar.getBoundingClientRect().bottom, sidebarHeight: sidebar.clientHeight, sidebarContentHeight: sidebar.scrollHeight,
-        positions: [sidebar, search, details].map(element => getComputedStyle(element).position) };
+        uniqueControls: ['#resultStatus', '#visibleCount', '#toggleAnsBtn','#keywordFilter'].every(selector => document.querySelectorAll(selector).length === 1),
+        position:getComputedStyle(sidebar).position };
     });
     assert.ok(layout.scroll <= width, JSON.stringify(layout));
-    assert.equal(layout.searchFirst, true);
-    assert.equal(layout.outsideDisclosure, true);
-    assert.equal(layout.resultInside, true);
-    assert.equal(layout.resultsOutsideDisclosure, true);
-    assert.equal(layout.uniqueControls, true);
+    assert.equal(layout.searchFirst, true);assert.equal(layout.outsideDisclosure, true);
+    assert.equal(layout.resultInside, true);assert.equal(layout.resultsOutsideDisclosure, true);assert.equal(layout.uniqueControls, true);
     assert.ok(layout.searchBottom <= layout.resultTop && layout.resultBottom <= layout.filterTop, JSON.stringify(layout));
-    if (width > 900) assert.ok(layout.searchRight <= layout.workspaceLeft, JSON.stringify(layout));
-    else {
-      assert.ok(layout.positions.every(position => !['sticky', 'fixed'].includes(position)), JSON.stringify(layout));
-      assert.ok(layout.firstQuestion >= layout.sidebarBottom, JSON.stringify(layout));
-      assert.ok(layout.sidebarContentHeight <= layout.sidebarHeight + 1, JSON.stringify(layout));
-    }
-    if (width <= 900) {
-      assert.equal(await page.locator('#keywordFilter').isVisible(), true);
-      assert.equal(await page.locator('#searchScope').isVisible(), true);
-      assert.equal(await page.locator('#searchMatch').isVisible(), true);
-      assert.equal(await page.locator('#visibleCount').isVisible(), true);
-      assert.equal(await page.locator('#toggleAnsBtn').isVisible(), true);
-      assert.equal(await page.locator('#sourceFilter').isVisible(), false);
-      await studyQuery(page, 'alpha beta', 1);
-      await page.locator('#clearSearch').click();
-      assert.equal(await page.locator('#visibleCount').textContent(), '6');
-      await page.locator('#filterDetails summary').click();
-      assert.equal(await page.locator('#chapterFilter').isVisible(), true);
-      await page.locator('#chapterFilter').selectOption('数组');
-      assert.equal(await page.locator('#visibleCount').textContent(), '2');
-      await page.locator('#resetFilters').click();
-    }
+    if (width >= 768) { assert.ok(layout.searchRight <= layout.workspaceLeft, JSON.stringify(layout));assert.equal(layout.position,'sticky'); }
+    for(const selector of ['#keywordFilter','#searchScope','#searchMatch','#visibleCount','#toggleAnsBtn']) assert.equal(await page.locator(selector).isVisible(),true);
+    await studyQuery(page, 'alpha beta', 1);
+    await page.locator('#clearSearch').click();assert.equal(await page.locator('#visibleCount').textContent(),'6');
+    if(!await page.locator('#filterDetails').evaluate(details=>details.open)) await page.locator('#filterDetails summary').click();
+    await page.locator('#chapterFilter').selectOption('数组');assert.equal(await page.locator('#visibleCount').textContent(),'2');
+    await page.locator('#resetFilters').click();await closeReaderControls(page);
+    if(width<=767) assert.equal(await page.locator('#keywordFilter').isVisible(),false);
   }
-  await page.locator('#themeToggle').selectOption('dark');
-  assert.equal(await page.locator('body').evaluate(body => body.classList.contains('dark-mode')), true);
-  await page.locator('#themeToggle').selectOption('light');
-  assert.equal(await page.locator('body').evaluate(body => body.classList.contains('dark-mode')), false);
+  await page.locator('#themeToggle').selectOption('dark');assert.equal(await page.locator('body').evaluate(body=>body.classList.contains('dark-mode')),true);
+  await page.locator('#themeToggle').selectOption('light');assert.equal(await page.locator('body').evaluate(body=>body.classList.contains('dark-mode')),false);
 }));
 
 test('source-unavailable image placeholders preserve explanations, metadata and manual links', () => withPage(async page => {
@@ -1500,45 +1507,30 @@ test('full search includes original source badges and question numbers while phr
   assert.equal(await page.locator('#visibleCount').textContent(), '3');
 }));
 
-test('desktop sidebar stays reachable while mobile sidebar scrolls normally and deep search shortcuts work', () => withPage(async page => {
-  const data = Array.from({ length: 60 }, (_, GlobalUID) => ({ GlobalUID, QuestionType: 'Single', ChapterName: 'Synthetic scroll chapter', DegreeLevel: '简单', DetailHtml: '<p>Synthetic long question.</p>'.repeat(5), SniffedAnswer: 'Synthetic answer' }));
-  await renderStudyFixture(page, data);
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  for (const width of [1440, 390]) {
-    await page.setViewportSize({ width, height: 900 });
-    for (const shortcut of ['Control+k', '/']) {
-      await page.evaluate(() => { document.activeElement.blur(); document.querySelector('.sidebar').scrollTop = 0; window.scrollTo({ top: 2400, behavior: 'instant' }); });
-      await page.waitForFunction(() => scrollY > 1000);
-      const before = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('.sidebar').getBoundingClientRect().top, bottom: document.querySelector('.sidebar').getBoundingClientRect().bottom }));
-      await page.evaluate(() => window.scrollBy({ top: 350, behavior: 'instant' }));
-      const after = await page.evaluate(() => ({ y: scrollY, top: document.querySelector('.sidebar').getBoundingClientRect().top, bottom: document.querySelector('.sidebar').getBoundingClientRect().bottom }));
-      assert.ok(after.y > before.y, JSON.stringify({ width, before, after }));
-      if (width > 900) {
-        assert.ok(before.top >= 0 && after.top >= 0 && after.bottom <= 900, JSON.stringify({ width, before, after }));
-        assert.ok(Math.abs(before.top - after.top) < 2, JSON.stringify({ width, before, after }));
-      } else {
-        assert.ok(before.top < 0 && after.top < before.top, JSON.stringify({ width, before, after }));
-        assert.ok(Math.abs((before.top - after.top) - (after.y - before.y)) < 2, JSON.stringify({ width, before, after }));
-      }
+test('desktop sidebar stays reachable and deep phone search shortcuts open the drawer without losing reading position', () => withPage(async page => {
+  const data = Array.from({length:60},(_,GlobalUID)=>({GlobalUID,QuestionType:'Single',ChapterName:'Synthetic scroll chapter',DegreeLevel:'简单',DetailHtml:'<p>Synthetic long question.</p>'.repeat(5),SniffedAnswer:'Synthetic answer'}));
+  await renderStudyFixture(page,data);await page.emulateMedia({reducedMotion:'reduce'});
+  for(const width of [1440,768,820,390]) {
+    await page.setViewportSize({width,height:900});await waitReaderControlsLayout(page);await closeReaderControls(page);
+    for(const shortcut of ['Control+k','/']) {
+      await page.evaluate(()=>{document.activeElement.blur();document.querySelector('.sidebar').scrollTop=0;scrollTo({top:2400,behavior:'instant'});});
+      await page.waitForFunction(()=>scrollY>1000);
+      const before=await page.locator('.sidebar').evaluate(sidebar=>({y:scrollY,top:sidebar.getBoundingClientRect().top}));
+      await page.evaluate(()=>scrollBy({top:350,behavior:'instant'}));
+      const readingY=await page.evaluate(()=>scrollY);assert.ok(readingY>before.y);
+      if(width>=768) {const top=await page.locator('.sidebar').evaluate(sidebar=>sidebar.getBoundingClientRect().top);assert.ok(top>=0&&Math.abs(top-before.top)<2);}
+      else assert.equal(await page.locator('#keywordFilter').isVisible(),false);
       await page.keyboard.press(shortcut);
-      await page.waitForFunction(() => {
-        const search = document.querySelector('#keywordFilter'), rect = search.getBoundingClientRect();
-        return document.activeElement === search && rect.top >= 0 && rect.bottom <= innerHeight;
-      });
-      assert.equal(await page.locator('#keywordFilter').isVisible(), true);
-      assert.equal(await page.locator('.topic').count(), 60);
+      await page.waitForFunction(()=>{const search=document.querySelector('#keywordFilter'),r=search.getBoundingClientRect();return document.activeElement===search&&r.top>=0&&r.bottom<=innerHeight;});
+      assert.equal(await page.locator('.topic').count(),60);
+      await closeReaderControls(page);
+      if(width<=767) assert.ok(Math.abs(await page.evaluate(()=>scrollY)-readingY)<2,'closing the phone controls restores the reading position');
     }
-    if (width > 900) {
-      await page.evaluate(() => { document.querySelector('.sidebar').scrollTop = 0; window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' }); });
-      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-      const bottom = await page.evaluate(() => {
-        const panel = document.querySelector('.sidebar').getBoundingClientRect(), input = document.querySelector('#keywordFilter').getBoundingClientRect();
-        return { y: scrollY, maximum: document.documentElement.scrollHeight - innerHeight, sidebarTop: panel.top, sidebarBottom: panel.bottom,
-          inputTop: input.top, inputBottom: input.bottom, viewportHeight: innerHeight };
-      });
-      assert.ok(Math.abs(bottom.y - bottom.maximum) < 2, JSON.stringify(bottom));
-      assert.ok(bottom.sidebarTop >= 0 && bottom.sidebarBottom <= bottom.viewportHeight, JSON.stringify(bottom));
-      assert.ok(bottom.inputTop >= 0 && bottom.inputBottom <= bottom.viewportHeight, JSON.stringify(bottom));
+    if(width>=768) {
+      await page.evaluate(()=>{document.querySelector('.sidebar').scrollTop=0;scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});});
+      await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+      const bottom=await page.evaluate(()=>{const panel=document.querySelector('.sidebar').getBoundingClientRect(),input=document.querySelector('#keywordFilter').getBoundingClientRect();return {y:scrollY,max:document.documentElement.scrollHeight-innerHeight,top:panel.top,bottom:panel.bottom,inputTop:input.top,inputBottom:input.bottom,height:innerHeight};});
+      assert.ok(Math.abs(bottom.y-bottom.max)<2);assert.ok(bottom.top>=0&&bottom.bottom<=bottom.height);assert.ok(bottom.inputTop>=0&&bottom.inputBottom<=bottom.height);
     }
   }
 }));
@@ -1587,14 +1579,14 @@ test('a short desktop viewport keeps sidebar controls keyboard-accessible withou
   await page.waitForFunction(previous => scrollY > previous + 100, priorY);
   assert.equal(await page.locator('#keywordFilter').inputValue(), 'Short viewport');
   await page.setViewportSize({ width: 390, height: 480 });
-  await page.waitForFunction(() => !document.querySelector('#filterDetails').open);
-  await page.locator('#filterDetails summary').click();
+  await openReaderControls(page);
+  if(!await page.locator('#filterDetails').evaluate(details=>details.open)) await page.locator('#filterDetails summary').click();
   await page.locator('#resetFilters').scrollIntoViewIfNeeded();
-  assert.equal(await page.locator('#resetFilters').isVisible(), true);
-  const mobile = await page.locator('.sidebar').evaluate(sidebar => ({ height: sidebar.clientHeight, content: sidebar.scrollHeight, top: sidebar.getBoundingClientRect().top,
-    questionTop: document.querySelector('.topic').getBoundingClientRect().top, bottom: sidebar.getBoundingClientRect().bottom }));
-  assert.ok(mobile.content <= mobile.height + 1, JSON.stringify(mobile));
-  assert.ok(mobile.questionTop >= mobile.bottom, JSON.stringify(mobile));
+  const reset=await page.locator('#resetFilters').boundingBox();
+  assert.ok(reset.y>=0&&reset.y+reset.height<=480,'short phone drawer must scroll every control into view');
+  await closeReaderControls(page);
+  assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+  assert.equal(await page.locator('.workspace').evaluate(node=>node.inert),false);
 }));
 
 test('repeated program copying preserves exact text and restores the normal feedback label', () => withPage(async page => {
@@ -1799,13 +1791,13 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
   assert.equal(source.split(timeoutDeclaration).length, 2, 'production timeout must remain a bounded thirty seconds');
   // Only the private test copy shortens the timeout; production and image bytes stay intact.
   const instrumented = source.replace(timeoutDeclaration, 'const PRINT_PREPARE_TIMEOUT_MS = 150;');
-  for (const mode of ['load', 'decode']) {
-    const harness = await createHarness(browser, instrumented), page = harness.page;
+  for (const mode of ['load', 'decode', 'phone-load']) {
+    const harness = await createHarness(browser, instrumented, undefined, mode==='phone-load'?{viewport:{width:390,height:480}}:{}), page = harness.page;
     let release; const gate = new Promise(resolve => { release = resolve; });
     try {
       const fixture = await printImageQueueFixture(page, 12);
       await page.route('**/images/*.png', async route => {
-        if (mode === 'load') await gate;
+        if (mode.endsWith('load')) await gate;
         await route.fulfill({ contentType: 'image/png', body: Buffer.from(fixture.png, 'base64') });
       });
       await page.setContent(fixture.html, { waitUntil: 'domcontentloaded' });
@@ -1836,7 +1828,8 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
         window.clearTimeout = handle => { __printTimers.delete(handle); clear(handle); };
       }, mode === 'decode');
       for (let attempt=0;attempt<2;attempt++) {
-        await page.locator('#printBtn').click();
+        if(mode==='phone-load') await page.keyboard.press('Control+p');
+        else await page.locator('#printBtn').click();
         await page.waitForFunction(() => {
           const status = document.querySelector('#printStatus');
           return status && !status.hidden && status.textContent.includes('超时') && !document.querySelector('#printBtn').disabled;
@@ -1844,6 +1837,7 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
         assert.match(await page.locator('#printStatus').textContent(), /未打开打印.*重试/);
         assert.equal(await page.locator('#printStatus').getAttribute('role'), 'alert');
         assert.equal(await page.locator('#printBtn').textContent(), '打印 / 保存 PDF');
+        if(mode==='phone-load') assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true','a failed phone print must keep its retry feedback reachable');
         assert.deepEqual(await page.evaluate(() => ({ prints:__printCalls, listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
           { prints:0, listeners:0, timers:0, unhandled:0 }, mode);
         if(mode==='decode') assert.equal(await page.evaluate(() => __releaseDecodes.length),2,'a retry must reuse unfinished native decodes instead of starting more');
@@ -1853,6 +1847,7 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
       await page.waitForFunction(() => [...document.querySelectorAll('.detail-box img')].every(image => image.complete && image.naturalWidth === 400));
       await page.keyboard.press('Control+p');
       await page.waitForFunction(() => __printCalls === 1 && !document.querySelector('#printBtn').disabled);
+      if(mode==='phone-load') assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'false');
       assert.equal(await page.locator('#printStatus').isVisible(), false);
       assert.equal(await page.locator('#printStatus').count(), 1);
       assert.deepEqual(await page.evaluate(() => ({ listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
@@ -1960,6 +1955,7 @@ test('narrow-screen prompt and answer images retain natural proportions despite 
   await page.waitForFunction(() => Array.from(document.querySelectorAll('.detail-box img,.answer-content img')).every(img => img.complete && img.naturalWidth === 1));
   for (const width of [390, 768]) {
     await page.setViewportSize({ width, height: 900 });
+    await waitReaderControlsLayout(page);
     const images = await page.locator('.detail-box img,.answer-content img').evaluateAll(nodes => nodes.map(img => {
       const rect = img.getBoundingClientRect();
       return { width: rect.width, height: rect.height, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight,
@@ -2593,6 +2589,7 @@ test('subjective questions inspect official details before AI and unresolved off
 }));
 
 async function settleReader(page) {
+  await waitReaderControlsLayout(page);
   await page.evaluate(async () => {
     await document.fonts.ready;
     for (let index=0;index<6;index++) await new Promise(requestAnimationFrame);
@@ -2714,7 +2711,7 @@ test('HTTP background prefetch and touch printing bound cold offscreen image req
       if(touch) assert.equal(requested,0,'far touch images must remain deferred');
       else assert.equal(requested,2,'desktop warming may fetch only two extra far images');
       await h.page.evaluate(()=>{window.__policyPrints=[];window.print=()=>__policyPrints.push([...document.querySelectorAll('.detail-box img')].every(img=>img.complete&&img.naturalWidth===400));});
-      if(touch) await h.page.locator('#printBtn').click();
+      if(touch) { await openReaderControls(h.page); await h.page.locator('#printBtn').click(); }
       for(let completed=0;completed<12;) {
         for(let retry=0;held.length===0&&retry<100;retry++) await h.page.waitForTimeout(10);
         assert.ok(held.length>0&&held.length<=2,'bounded pending image batch');
@@ -2820,4 +2817,135 @@ test('percentage widths and padding survive late images and filtered restoration
     assert.equal(await page.locator('.detail-box img').getAttribute('alt'),'Late percentage diagram');
     assert.match(await page.locator('.detail-box').first().textContent(),/After the late diagram/);
   } finally {release();}
+}));
+
+test('phone drawer closes by button, Escape and backdrop with preserved controls and reading position',async()=>{
+  for(const fallback of [false,true]) await withPage(async page=>{
+    await page.setViewportSize({width:390,height:844});
+    if(fallback) await page.evaluate(()=>Object.defineProperty(HTMLDialogElement.prototype,'showModal',{configurable:true,value:undefined}));
+    const rows=Array.from({length:50},(_,GlobalUID)=>({GlobalUID,QuestionType:'Single',ChapterName:'Phone fixture',DetailHtml:'<p>Synthetic drawer reading question.</p>'.repeat(4),SniffedAnswer:'Synthetic answer'}));
+    await renderStudyFixture(page,rows);
+    await page.evaluate(()=>{window.__originalReaderSidebar=document.querySelector('#readerSidebar');document.querySelector('.app-layout').setAttribute('aria-hidden','false');scrollTo(0,2400);});
+    const readingY=await page.evaluate(()=>scrollY);
+    assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+    for(const method of ['button','escape','backdrop']) {
+      await page.locator('#mobileControls').click();
+      await page.waitForFunction(()=>document.activeElement.id==='drawerClose');
+      assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
+      assert.equal(await page.evaluate(()=>__originalReaderSidebar===document.querySelector('#readerSidebar')),true);
+      assert.equal(await page.locator('#keywordFilter').inputValue(),method==='escape'?'Synthetic drawer':'');
+      await page.locator('#keywordFilter').fill('Synthetic drawer');
+      await page.waitForFunction(()=>document.querySelector('#visibleCount').textContent==='50');
+      if(method==='button') {
+        await page.locator('#keywordFilter').evaluate(input=>input.dispatchEvent(new CompositionEvent('compositionstart')));
+        // Synthetic events exercise the application's IME guard; a normal real
+        // Escape would invoke the search input's native clear action, not an IME.
+        await page.locator('#keywordFilter').evaluate(input=>{
+          for(const isComposing of [false,true]) input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true,isComposing}));
+        });
+        assert.equal(await page.locator('#keywordFilter').inputValue(),'Synthetic drawer');
+        assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
+        const cancelled=await page.locator('#mobileDrawer').evaluate(drawer=>{const event=new Event('cancel',{cancelable:true});drawer.dispatchEvent(event);return event.defaultPrevented;});
+        assert.equal(cancelled,true);assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
+        await page.locator('#keywordFilter').evaluate(input=>input.dispatchEvent(new CompositionEvent('compositionend')));
+      }
+      if(method==='button') await page.locator('#drawerClose').click();
+      else if(method==='escape') {
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('#keywordFilter').inputValue(),'');
+        assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
+        await page.keyboard.press('Escape');
+      }
+      else if(fallback) await page.locator('#drawerBackdrop').click({position:{x:2,y:2}});
+      else {
+        const rect=await page.locator('#mobileDrawer').boundingBox();
+        assert.ok(rect.y>1||rect.x>1,'native dialog must leave a clickable backdrop');
+        await page.mouse.click(rect.x>1?1:Math.min(10,rect.width/2),rect.y>1?1:Math.min(10,rect.height/2));
+      }
+      await page.waitForFunction(()=>document.querySelector('#mobileControls').getAttribute('aria-expanded')==='false');
+      assert.equal(await page.evaluate(()=>document.activeElement.id),'mobileControls');
+      assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+      assert.equal(await page.locator('#keywordFilter').inputValue(),method==='escape'?'':'Synthetic drawer');
+      assert.equal(await page.locator('.app-layout').getAttribute('aria-hidden'),'false');
+      assert.ok(Math.abs(await page.evaluate(()=>scrollY)-readingY)<2);
+      assert.equal(await page.locator('.topic').count(),50);
+    }
+    await openReaderControls(page);
+    await page.evaluate(()=>{
+      document.querySelector('#drawerClose').click();
+      document.querySelector('#mobileControls').click();
+    });
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true','an older close event must not close the newly reopened drawer');
+    assert.equal(await page.locator('#mobileDrawer').evaluate(drawer=>drawer.open),true);
+    await closeReaderControls(page);
+  });
+});
+
+test('phone drawer traps keyboard focus, isolates background and restores the shortcut opener',()=>withPage(async page=>{
+  await page.setViewportSize({width:390,height:480});
+  await renderStudyFixture(page,geometryRows(30));
+  const opener=page.locator('.answer-toggle').nth(10);await opener.scrollIntoViewIfNeeded();await opener.focus();
+  await page.evaluate(()=>{window.__shortcutOpener=document.activeElement;window.__readingTop=scrollY;});
+  await page.keyboard.press('Control+k');
+  await page.waitForFunction(()=>document.activeElement.id==='keywordFilter');
+  const isolation=await page.evaluate(()=>{
+    const background=document.querySelector('.workspace');let node=background,isolated=false;
+    while(node){isolated ||= node.inert===true;node=node.parentElement;}
+    __shortcutOpener.focus();
+    return {isolated,backgroundFocused:document.activeElement===__shortcutOpener,bodyFixed:getComputedStyle(document.body).position==='fixed'};
+  });
+  assert.equal(isolation.isolated,true);assert.equal(isolation.backgroundFocused,false);assert.equal(isolation.bodyFixed,true);
+  if(!await page.locator('#filterDetails').evaluate(details=>details.open)) await page.locator('#filterDetails summary').click();
+  await page.locator('#drawerClose').focus();
+  const visited=new Set();
+  for(let index=0;index<26;index++) {
+    await page.keyboard.press('Tab');
+    const focus=await page.evaluate(()=>({inside:document.querySelector('#mobileDrawer').contains(document.activeElement),id:document.activeElement.id}));
+    assert.equal(focus.inside,true);visited.add(focus.id);
+  }
+  assert.ok(visited.has('resetFilters')&&visited.has('drawerClose')&&visited.has('keywordFilter'));
+  await page.locator('#drawerClose').focus();await page.keyboard.press('Shift+Tab');
+  assert.equal(await page.evaluate(()=>document.querySelector('#mobileDrawer').contains(document.activeElement)),true);
+  await page.mouse.move(3,3);await page.mouse.wheel(0,600);
+  const locked=await page.evaluate(()=>({fixed:getComputedStyle(document.body).position==='fixed',top:document.body.style.top}));
+  assert.equal(locked.fixed,true);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.evaluate(()=>document.activeElement===__shortcutOpener),true);
+  assert.ok(await page.evaluate(()=>Math.abs(scrollY-__readingTop)<2));
+  assert.notEqual(await page.locator('body').evaluate(body=>getComputedStyle(body).position),'fixed');
+  await opener.click();assert.equal(await opener.getAttribute('aria-expanded'),'false');
+}));
+
+test('phone to tablet transitions and printing release the drawer without duplicating or resetting controls',()=>withPage(async page=>{
+  await page.setViewportSize({width:767,height:900});await renderStudyFixture(page);
+  await page.evaluate(()=>{window.__sameReaderSidebar=document.querySelector('#readerSidebar');});
+  await openReaderControls(page);await studyQuery(page,'alpha beta',1);
+  await page.locator('#keywordFilter').focus();
+  for(const width of [768,820,1024]) {
+    await page.setViewportSize({width,height:900});
+    await page.waitForFunction(()=>!document.querySelector('#mobileDrawer').open&&document.querySelector('#readerSidebar').parentElement.classList.contains('app-layout'));
+    assert.equal(await page.locator('#mobileControls').isVisible(),false);
+    assert.equal(await page.evaluate(()=>document.activeElement.id),'keywordFilter');
+    assert.equal(await page.locator('#readerSidebar').evaluate(sidebar=>getComputedStyle(sidebar).position),'sticky');
+    assert.equal(await page.locator('#keywordFilter').inputValue(),'alpha beta');assert.equal(await page.locator('#visibleCount').textContent(),'1');
+    assert.equal(await page.evaluate(()=>__sameReaderSidebar===document.querySelector('#readerSidebar')),true);
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+  }
+  await page.setViewportSize({width:767,height:900});
+  await page.waitForFunction(()=>document.activeElement.id==='mobileControls');
+  assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+  await openReaderControls(page);
+  await page.evaluate(()=>{window.__drawerPrint=[];window.print=()=>{
+    let node=document.querySelector('.workspace'),inert=false;while(node){inert ||= node.inert===true;node=node.parentElement;}
+    __drawerPrint.push({open:document.querySelector('#mobileDrawer').open,inert,fixed:getComputedStyle(document.body).position==='fixed'});
+  };});
+  await page.locator('#printBtn').click();await page.waitForFunction(()=>__drawerPrint.length===1);
+  assert.deepEqual(await page.evaluate(()=>__drawerPrint),[{open:false,inert:false,fixed:false}]);
+  await openReaderControls(page);assert.equal(await page.locator('#keywordFilter').inputValue(),'alpha beta');
+  await page.evaluate(()=>window.dispatchEvent(new Event('beforeprint')));
+  await page.waitForFunction(()=>document.querySelector('#mobileControls').getAttribute('aria-expanded')==='false');
+  await page.evaluate(()=>window.dispatchEvent(new Event('afterprint')));
+  await openReaderControls(page);await page.locator('#clearSearch').click();assert.equal(await page.locator('#visibleCount').textContent(),'6');
+  await closeReaderControls(page);
 }));

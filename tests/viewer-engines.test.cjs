@@ -7,7 +7,7 @@ const { launch, createHarness } = require('./harness.cjs');
 
 let coldImageExport;
 before(async () => {
-  // Extraction runs in Chrome. Both reader engines consume the identical export,
+  // Extraction runs in Chrome. All reader engines consume the identical export,
   // so WebKit's blob handling in the extractor is not part of this reader test.
   const builder = await launch('chromium');
   const harness = await createHarness(builder);
@@ -36,16 +36,17 @@ function fixture() {
 }
 
 async function withViewer(engine, fn, mobile = false) {
-  const browser = await launch(engine);
-  let harness;
+  let browser, harness;
+  const watchdog=setTimeout(()=>{ if(browser) void browser.close().catch(()=>{}); },85000);
   try {
+    browser = await launch(engine);
     harness = await createHarness(browser, undefined, undefined, mobile
-      ? {viewport:{width:390,height:844},hasTouch:true,isMobile:true,deviceScaleFactor:2}
+      ? {viewport:{width:390,height:844},hasTouch:true,...(engine==='firefox'?{}:{isMobile:true}),deviceScaleFactor:2}
       : {viewport:{width:1440,height:900}});
     const errors=[]; harness.page.on('pageerror',error=>errors.push(error.message));
     await fn(harness.page);
     assert.deepEqual(errors,[]);
-  } finally { await harness?.close(); await browser.close(); }
+  } finally { clearTimeout(watchdog); await harness?.close(); await browser?.close(); }
 }
 async function render(page, rows = fixture()) {
   const html = await page.evaluate(data=>{__test.setData(data);return __test.generateOfflineHtml(true);},rows);
@@ -57,8 +58,8 @@ async function query(page, text, count) {
   await page.waitForFunction(expected=>document.querySelector('#visibleCount').textContent===String(expected),count);
 }
 
-for (const engine of ['chromium','webkit']) {
-  test(engine+': offline source, type, chapter, difficulty and both search modes preserve answer state',()=>withViewer(engine,async page=>{
+for (const engine of ['chromium','firefox','webkit']) {
+  test(engine+': offline source, type, chapter, difficulty and both search modes preserve answer state',{timeout:90000},()=>withViewer(engine,async page=>{
     await render(page);
     assert.equal(await page.locator('.topic').count(),6);
     await page.locator('#sourceFilter').selectOption('illinois');
@@ -100,14 +101,20 @@ for (const engine of ['chromium','webkit']) {
     assert.equal(await page.locator('body').evaluate(body=>body.classList.contains('dark-mode')),true);
   }));
 
-  test(engine+': mobile reader retains exact program copying and access to the last question',()=>withViewer(engine,async page=>{
+  test(engine+': mobile reader retains exact program copying and access to the last question',{timeout:90000},()=>withViewer(engine,async page=>{
     const marker='SyntheticEngineLastQuestionMarker';
     const rows=Array.from({length:60},(_,GlobalUID)=>({GlobalUID,QuestionType:'Program',ChapterName:'Programming',DegreeLevel:'一般',
       DetailHtml:'<p>'+(GlobalUID===59?marker:'Synthetic long reader question')+'</p>',SniffedAnswer:program+'// '+GlobalUID+'\r\n',AnswerSource:'platform-reference'}));
     await render(page,rows);
-    assert.equal(await page.locator('#filterDetails').evaluate(details=>details.open),false);
+    assert.equal(await page.locator('#mobileControls').isVisible(),true);
+    assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+    await page.locator('#mobileControls').click();
+    assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true');
     assert.equal(await page.locator('#visibleCount').isVisible(),true);
     assert.equal(await page.locator('#toggleAnsBtn').isVisible(),true);
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+    assert.equal(await page.evaluate(()=>document.activeElement.id),'mobileControls');
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
     await page.evaluate(()=>{window.__engineCopies=[];Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>__engineCopies.push(text)}});});
     await page.locator('.copy-btn').first().click();
@@ -125,15 +132,34 @@ for (const engine of ['chromium','webkit']) {
     await page.waitForFunction(()=>document.activeElement.id==='keywordFilter');
     await query(page,marker,1);
     assert.equal(await page.locator('.topic:not(.hidden) .code-box').textContent(),rows.at(-1).SniffedAnswer);
+    // Viewport coverage only; these are not claims of physical iPad/iPhone tests.
+    for(const viewport of [{width:844,height:390},{width:390,height:844},
+      {width:768,height:1024},{width:1024,height:768},
+      {width:820,height:1180},{width:1180,height:820},{width:390,height:844}]) {
+      await page.setViewportSize(viewport);
+      if(viewport.width>=768) {
+        await page.waitForFunction(()=>!document.querySelector('#mobileDrawer').open&&document.querySelector('#readerSidebar').parentElement.classList.contains('app-layout'));
+        assert.equal(await page.locator('#mobileControls').isVisible(),false);
+        assert.equal(await page.locator('#keywordFilter').isVisible(),true);
+        assert.equal(await page.locator('#readerSidebar').evaluate(sidebar=>getComputedStyle(sidebar).position),'sticky');
+      } else {
+        await page.waitForFunction(()=>document.querySelector('#mobileControls').getBoundingClientRect().width>0&&document.querySelector('#readerSidebar').parentElement.id==='drawerContent'&&!document.querySelector('#mobileDrawer').open);
+        assert.equal(await page.locator('#keywordFilter').isVisible(),false);
+        await page.locator('#mobileControls').click();
+      }
+      assert.equal(await page.locator('#keywordFilter').inputValue(),marker);
+      assert.equal(await page.locator('#visibleCount').textContent(),'1');
+      assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+      assert.equal(await page.locator('.topic').count(),60);
+      if(viewport.width<768) await page.locator('#drawerClose').click();
+    }
+    await page.locator('#mobileControls').click();
     await page.locator('#clearSearch').click();
     assert.equal(await page.locator('#visibleCount').textContent(),'60');
-    await page.setViewportSize({width:844,height:390});
-    await page.locator('#keywordFilter').scrollIntoViewIfNeeded();
-    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
-    assert.equal(await page.locator('.topic').count(),60);
+    await page.locator('#drawerClose').click();
   },true));
 
-  test(engine+': cold local images finish before explicit printing and print layout retains content',()=>withViewer(engine,async page=>{
+  test(engine+': cold local images finish before explicit printing and print layout retains content',{timeout:90000},()=>withViewer(engine,async page=>{
     const fixtureData=coldImageExport;
     let release;const gate=new Promise(resolve=>{release=resolve;});
     await page.route('**/images/*.png',async route=>{await gate;await route.fulfill({contentType:'image/png',body:Buffer.from(fixtureData.png,'base64')});});

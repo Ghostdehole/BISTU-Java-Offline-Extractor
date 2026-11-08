@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium, webkit } = require('playwright');
+const { chromium, firefox, webkit } = require('playwright');
 
 const sourcePath = path.resolve(__dirname, '..', 'BISTU_Java_Extractor.user.js');
 const jszipPath = require.resolve('jszip/dist/jszip.min.js');
@@ -40,9 +40,10 @@ function instrument(source) {
 }
 
 async function launch(engine = 'chromium') {
-  if (!['chromium', 'webkit'].includes(engine)) throw new Error('Unsupported test browser engine');
-  return (engine === 'webkit' ? webkit : chromium).launch({
+  if (!['chromium', 'firefox', 'webkit'].includes(engine)) throw new Error('Unsupported test browser engine');
+  return ({ chromium, firefox, webkit }[engine]).launch({
     headless: true,
+    timeout: 30000,
     ...(engine === 'chromium' && process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {})
   });
 }

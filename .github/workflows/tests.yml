@@ -17,6 +17,6 @@ jobs:
           node-version: 24
       - run: npm install --global pnpm@11.25.0
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm exec playwright install --with-deps chromium webkit
+      - run: pnpm exec playwright install --with-deps chromium firefox webkit
       - run: node --check BISTU_Java_Extractor.user.js
       - run: pnpm test
