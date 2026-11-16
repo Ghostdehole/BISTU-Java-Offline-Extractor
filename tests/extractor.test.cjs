@@ -420,7 +420,7 @@ test('OCR login HTML skips AI without storing an image, then stage 4 pauses for 
     __test.state.stage = 3;
     __test.keyManager.updateKeys('synthetic-test-key');
     const url = 'http://fixture.test/picture.png';
-    __test.setData([{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'fixture', Title: 'Synthetic image question', DetailHtml: '<p>Read the picture</p>', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false }]);
+    __test.setData([{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'fixture', Title: 'Synthetic image question', DetailHtml: '<p>Read the picture</p><img src="images/img_1.png">', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false }]);
     __test.setImages([[url, { filename: 'img_1.png', downloaded: false, failed: false, buffer: null }]]);
     const calls = [];
     window.__fetch = async target => { calls.push(target); return new Response('<html><input type="password"></html>', { status: 200, headers: { 'Content-Type': 'text/html' } }); };
@@ -1390,7 +1390,7 @@ test('OCR errors and empty recognition leave AI unanswered until image text can 
     __test.keyManager.updateKeys('synthetic-test-key');
     const url = 'http://fixture.test/picture.png';
     const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII='), char => char.charCodeAt(0)).buffer;
-    __test.setData([{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'ocr-fixture', DetailHtml: '<p>OCR fixture</p>', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false, ExtractionWarning: 'Keep this platform warning' }]);
+    __test.setData([{ GlobalUID: 0, QuestionType: 'Blank', TopicGuid: 'ocr-fixture', DetailHtml: '<p>OCR fixture</p><img src="images/img_1.png">', imgUrls: [url], NeedsAI: true, s2_done: true, s3_done: false, ExtractionWarning: 'Keep this platform warning' }]);
     __test.setImages([[url, { filename: 'img_1.png', buffer: png, downloaded: true }]]);
     let mode = 'throw', calls = 0;
     Tesseract.createWorker = async () => ({ recognize: async () => {
@@ -1432,7 +1432,7 @@ test('original Illinois and regular sources retain exact classification, badges 
     [undefined, 'Blank', undefined, 'unclassified']
   ].map(([ChapterName, QuestionType, DegreeLevel, text], GlobalUID) => ({ GlobalUID, ChapterName, QuestionType, DegreeLevel, DetailHtml: `<p>${text} synthetic source fixture</p>`, SniffedAnswer: 'Synthetic answer' }));
   await renderStudyFixture(page, rows);
-  assert.deepEqual(new Set(await page.locator('#sourceFilter option').evaluateAll(options => options.map(option => option.value))), new Set(['all', 'normal', 'illinois']));
+  assert.deepEqual(new Set(await page.locator('#sourceFilter option').evaluateAll(options => options.map(option => option.value))), new Set(['all', 'normal', 'illinois', 'homework']));
   assert.equal(await page.locator('.topic[data-source="illinois"]').count(), 3);
   assert.equal(await page.locator('.topic[data-source="normal"]').count(), 6);
   for (const card of await page.locator('.topic[data-source="illinois"]').all()) assert.match(await card.locator('.question-head').innerText(), /伊利诺伊/);
@@ -1443,6 +1443,10 @@ test('original Illinois and regular sources retain exact classification, badges 
     await page.locator(selector).selectOption(value);
     await page.waitForFunction(expected => document.querySelector('#visibleCount').textContent === String(expected), count);
   };
+  await select('#sourceFilter', 'homework', 0);
+  assert.equal(await page.locator('#emptyState').isVisible(), true);
+  await select('#sourceFilter', 'all', 9);
+  assert.equal(await page.locator('#emptyState').isVisible(), false);
   await select('#sourceFilter', 'illinois', 3);
   await select('#chapterFilter', 'Programming', 2);
   await select('#typeFilter', 'Program', 1);
@@ -1839,7 +1843,10 @@ test('print preparation times out stalled loads or decodes, cleans listeners and
         assert.equal(await page.locator('#printBtn').textContent(), '打印 / 保存 PDF');
         if(mode==='phone-load') assert.equal(await page.locator('#mobileControls').getAttribute('aria-expanded'),'true','a failed phone print must keep its retry feedback reachable');
         assert.deepEqual(await page.evaluate(() => ({ prints:__printCalls, listeners:__printListenerSets.reduce((sum,set)=>sum+set.size,0), timers:__printTimers.size, unhandled:__unhandledPrintErrors })),
-          { prints:0, listeners:0, timers:0, unhandled:0 }, mode);
+          // A failed HTTP print resumes the two background image workers. Their
+          // callbacks may remain while responses are held, but retries cannot
+          // accumulate old callbacks and completed image loads must clear all.
+          { prints:0, listeners:mode.endsWith('load')?2:0, timers:0, unhandled:0 }, mode);
         if(mode==='decode') assert.equal(await page.evaluate(() => __releaseDecodes.length),2,'a retry must reuse unfinished native decodes instead of starting more');
       }
       release();
@@ -2319,7 +2326,7 @@ test('vision uses the stricter 4096-pixel limit at exactly fifteen images and pr
     const entries = [], rows = [14, 15].map((count, GlobalUID) => {
       const urls = Array.from({ length: count }, (_, index) => 'http://fixture.test/boundary-' + GlobalUID + '-' + index + '.png');
       urls.forEach(url => entries.push([url, { filename: 'img_' + (entries.length + 1) + '.png', buffer, downloaded: true }]));
-      return { GlobalUID, TopicGuid: 'boundary-' + count, QuestionType: 'Blank', DetailHtml: '<p>Boundary ' + count + '</p>', s2_done: true,
+      return { GlobalUID, TopicGuid: 'boundary-' + count, QuestionType: 'Blank', DetailHtml: '<p>Boundary ' + count + '</p>'+urls.map(url=>'<img src="'+url+'">').join(''), s2_done: true,
         PlatformDetailChecked: true, s3_done: false, NeedsAI: true, imgUrls: urls };
     });
     __test.setImages(entries); __test.setData(rows);
@@ -2409,7 +2416,7 @@ test('resume replaces the stale paused status immediately before a pending stage
   });
   assert.equal(waiting.entered, true);
   assert.equal(waiting.paused, false);
-  assert.match(waiting.status, /AI 大模型作答中/);
+  assert.match(waiting.status, /AI 解答与答案复核中/);
   assert.doesNotMatch(waiting.status, /暂停|挂起/);
   await page.evaluate(() => __releaseResumeStatus());
   await page.waitForFunction(() => window.__resumeStatusPackaged && !document.querySelector('#bistu-pause-btn').disabled);

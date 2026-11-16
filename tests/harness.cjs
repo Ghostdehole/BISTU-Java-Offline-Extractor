@@ -21,6 +21,10 @@ function instrument(source) {
       restorePlatformVariables: typeof restorePlatformVariables === 'function' ? restorePlatformVariables : undefined,
       validateImageBuffer: typeof validateImageBuffer === 'function' ? validateImageBuffer : undefined,
       getImageDimensions: buffer => typeof imageDimensions !== 'undefined' ? imageDimensions.get(buffer) : undefined,
+      parseHomeworkDetail: typeof parseHomeworkDetail === 'function' ? parseHomeworkDetail : undefined,
+      homeworkFingerprint: typeof homeworkFingerprint === 'function' ? homeworkFingerprint : undefined,
+      mergeHomeworkQuestions: typeof mergeHomeworkQuestions === 'function' ? mergeHomeworkQuestions : undefined,
+      runHomeworkSupplement: typeof runHomeworkSupplement === 'function' ? runHomeworkSupplement : undefined,
       get state() { return globalState; },
       get data() { return allData; },
       get images() { return imageQueue; },
@@ -81,6 +85,7 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
     $.fn = { zTree: { getZTreeObj: () => ({ getSelectedNodes: () => window.__chapters }) } };
     $.ajax = options => {
       let data = options.data;
+      if (typeof data === 'string' && /application\/json/i.test(options.contentType || '')) data = JSON.parse(data);
       const entries = Array.isArray(data) ? data.map(({name,value}) => [name,value]) : typeof data === 'string' ? [...new URLSearchParams(data)] : null;
       if (entries) {
         data = {};
@@ -108,6 +113,10 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
   });
   await page.addScriptTag({ content: instrument(sourceOverride || fs.readFileSync(sourcePath, 'utf8')) });
   await page.evaluate(() => {
+    // Existing extraction fixtures intentionally exercise Practice only. Homework
+    // cases opt in explicitly and supply their own fully synthetic responses.
+    if (document.querySelector('#bistu-setting-includeHomework')) __setSettings({ includeHomework: 'disabled' });
+    if (document.querySelector('#bistu-setting-answerReviewMode')) __setSettings({ answerReviewMode: 'missing-only' });
     __test.initializePlatformVariables();
     __test.state.isPaused = false;
   });
