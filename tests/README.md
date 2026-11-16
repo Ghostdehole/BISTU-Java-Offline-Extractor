@@ -6,7 +6,7 @@
 
 ```sh
 npx pnpm@11.25.0 install --frozen-lockfile --ignore-scripts
-npx pnpm@11.25.0 exec playwright install chromium
+npx pnpm@11.25.0 exec playwright install chromium firefox webkit
 npx pnpm@11.25.0 test
 ```
 
@@ -27,3 +27,5 @@ npx pnpm@11.25.0 test
 7.15.0 新增图片可信尺寸与固定比例、异步解码与延迟响应后不发生布局偏移、冷图片打印等待、快捷键与重复打印去重、连续复制反馈恢复等覆盖。图片尺寸只从成功解码的真实字节取得，不信任导入元数据；无法取得尺寸时不猜测。图片提前读取，未采用会增加低性能跨库布局耗时的懒加载。打印按钮、Ctrl/Cmd+P 等待 load/error 与可用的 decode，超时后清理等待并恢复操作；浏览器直接打印的 beforeprint／print 媒体入口也请求加载全部图片。
 
 测试只证明上述可复现行为，不将模拟 Key、usage 或图片输入等同于真实服务可用性或答案正确率；最终测试数量、真实授权运行、最终包独立审计与阅读页验收另见 [验证记录](../TESTING.md)。
+
+7.18.0 新增 `homework.test.cjs`（只读分页、课程／登录／题型核验、强内容去重、作业来源重叠与恢复）、`answer-review.test.cjs`（独立作答／二次比较、答案优先与续传）、`apple-compat.test.cjs`（Chromium／WebKit 兼容路径、布局、图片及打印）。原测试显式选择旧“仅补缺答案”模式，以继续验证旧版功能；新增套验证默认双重复核。全部采用模拟接口，真实 Key 不进入测试或版本库。
