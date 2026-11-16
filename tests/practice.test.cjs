@@ -308,6 +308,7 @@ test('practice completion: local draft symbols and keywords replace only the car
 
 test('practice completion: cancellation, composition and readonly code never overwrite drafts or trigger execution', () => withReader(async page => {
   const row = await openPractice(page, 4), editor = row.locator('.practice-code'), popup = page.locator('#practiceCompletions');
+  await focusEditor(editor);
   await editor.fill('publ'); await popup.waitFor({ state: 'visible' }); await page.keyboard.press('Escape');
   assert.equal(await editor.inputValue(), 'publ'); assert.equal(await popup.isVisible(), false);
   await editor.evaluate(input => input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' })));
