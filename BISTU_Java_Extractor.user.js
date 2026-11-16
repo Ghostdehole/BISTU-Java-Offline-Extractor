@@ -230,7 +230,7 @@
             <div style="padding:12px 15px; color:#ccc; font-size:13px; border-bottom:1px solid #333; flex-shrink: 0; background:rgba(0,0,0,0.2);">
                 <div id="bistu-step-1" style="margin-bottom:6px;">⏳ 1. 扫描云端题库: <span id="bistu-val-1" style="color:#4db6ac; font-weight:bold;">等待</span></div>
                 <div id="bistu-step-2" style="margin-bottom:6px;">⏳ 2. 题目、选项与答案验证: <span id="bistu-val-2" style="color:#4db6ac; font-weight:bold;">等待</span></div>
-                <div id="bistu-step-3" style="margin-bottom:6px;">⏳ 3. 仅对平台无答案题进行 AI 解答: <span id="bistu-val-3" style="color:#4db6ac; font-weight:bold;">等待</span></div>
+                <div id="bistu-step-3" style="margin-bottom:6px;">⏳ 3. AI 独立解答与答案复核: <span id="bistu-val-3" style="color:#4db6ac; font-weight:bold;">等待</span></div>
                 <div id="bistu-step-4" style="margin-bottom:2px;">⏳ 4. 图片并发兜底下载: <span id="bistu-val-4" style="color:#4db6ac; font-weight:bold;">等待</span></div>
             </div>
 
