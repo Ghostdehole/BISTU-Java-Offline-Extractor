@@ -157,12 +157,21 @@ test('panel: the hidden key editor deduplicates continuation lines and only chec
   assert.deepEqual(new Set(result.calls.map(row => row.authorization)), new Set(['Bearer synthetic-panel-key-alpha','Bearer synthetic-panel-key-beta']));
   assert.doesNotMatch(result.logs + result.storage, /synthetic-panel-key-(alpha|beta)/);
   assert.match(await page.locator('#bistu-key-count').textContent(), /2/);
+  const checkedStatus = await page.locator('#bistu-key-status').textContent();
+  await page.evaluate(() => __test.refreshPanelControls());
+  assert.equal(await page.locator('#bistu-key-status').textContent(), checkedStatus, 'ordinary state refresh retains the last detection result');
   await page.locator('#bistu-show-keys').click();
   // Whether the reveal control masks text or closes the editor is presentation;
   // the explicit editor toggle must always be able to remove it from view.
   if (await page.locator('#bistu-keys-editor').isVisible()) await page.locator('#bistu-edit-keys').click();
   assert.equal(await page.locator('#bistu-keys-editor').isVisible(), false);
   assert.equal(await page.locator('#bistu-apikey').inputValue(), 'synthetic-panel-key-alpha\\\nsynthetic-panel-key-beta; synthetic-panel-key-alpha');
+  await page.locator('#bistu-edit-keys').click();
+  await page.locator('#bistu-apikey').fill('synthetic-panel-key-gamma');
+  assert.notEqual(await page.locator('#bistu-key-status').textContent(), checkedStatus);
+  assert.match(await page.locator('#bistu-key-status').textContent(), /重新检测/);
+  assert.match(await page.locator('#bistu-key-count').textContent(), /1/);
+  assert.equal(await page.evaluate(() => __balanceCalls.length), 2, 'editing a key does not silently make another request');
 }));
 
 test('panel: invalid settings focus the offending field and reset retains optional credentials', () => withPanel(async page => {
@@ -171,6 +180,18 @@ test('panel: invalid settings focus the offending field and reset retains option
   await page.locator('#bistu-apikey').fill('synthetic-reset-key');
   await page.locator('#bistu-tab-settings').click();
   const defaultConcurrency = await page.locator('#bistu-setting-aiConcurrency').inputValue();
+  assert.equal(await page.locator('#bistu-setting-includeHomework').inputValue(), 'disabled');
+  const disabledHomeworkHint = await page.locator('#bistu-homework-status').textContent();
+  await page.locator('#bistu-setting-includeHomework').selectOption('enabled');
+  await page.locator('#bistu-tab-overview').click();
+  assert.equal(await page.locator('#bistu-homework-status').isVisible(), true);
+  const enabledHomeworkHint = await page.locator('#bistu-homework-status').textContent();
+  assert.notEqual(enabledHomeworkHint, disabledHomeworkHint, 'explicit setting changes refresh the overview');
+  await page.locator('#bistu-tab-settings').click();
+  await page.locator('#bistu-setting-includeHomework').selectOption('disabled');
+  await page.locator('#bistu-tab-overview').click();
+  assert.equal(await page.locator('#bistu-homework-status').textContent(), disabledHomeworkHint);
+  await page.locator('#bistu-tab-settings').click();
   await page.locator('#bistu-setting-aiConcurrency').fill('0');
   await page.locator('#bistu-tab-overview').click();
   await page.locator('#bistu-start-btn').click();
@@ -185,6 +206,10 @@ test('panel: invalid settings focus the offending field and reset retains option
   assert.equal(await page.locator('#bistu-setting-aiConcurrency').inputValue(), defaultConcurrency);
   assert.equal(await page.locator('#bistu-apikey').inputValue(), 'synthetic-reset-key');
   assert.equal(await page.evaluate(() => Object.values(__test.getSettings()).includes(undefined)), false);
+  assert.equal(await page.locator('#bistu-setting-includeHomework').inputValue(), 'enabled');
+  await page.locator('#bistu-tab-overview').click();
+  assert.equal(await page.locator('#bistu-homework-status').isVisible(), true);
+  assert.equal(await page.locator('#bistu-homework-status').textContent(), enabledHomeworkHint, 'reset defaults cannot retain the disabled-task caption');
 }));
 
 test('panel: filtered logs are literal, sanitized when copied, and clearing does not reset the task', () => withPanel(async page => {

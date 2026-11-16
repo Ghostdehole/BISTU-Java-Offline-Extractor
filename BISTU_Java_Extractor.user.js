@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.19.1
+// @version      7.19.2
 // @description  练习优先，作业补题去重；题干、选项与原图离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.19.1'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.19.2'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -357,9 +357,6 @@
     const panel = document.getElementById(panelId);
     const header = document.getElementById(`${panelId}-header`);
     const logBox = document.getElementById(`${panelId}-log`);
-    const apiKeyContainer = document.getElementById('bistu-apikey-container');
-    const initActions = document.getElementById('bistu-init-actions');
-    const runActions = document.getElementById('bistu-run-actions');
     const startBtn = document.getElementById('bistu-start-btn');
     const importBtn = document.getElementById('bistu-import-btn');
     const fileInput = document.getElementById('bistu-file-input');
@@ -452,7 +449,10 @@
     }
     document.getElementById('bistu-edit-keys').addEventListener('click', () => setKeyEditorOpen(document.getElementById('bistu-keys-editor').hidden));
     document.getElementById('bistu-show-keys').addEventListener('click', () => { keyInputVisible = !keyInputVisible; renderKeyInputVisibility(); });
-    apiKeyInput.addEventListener('input', refreshKeySummary);
+    apiKeyInput.addEventListener('input', () => {
+        refreshKeySummary();
+        document.getElementById('bistu-key-status').textContent = 'Key 已修改，请重新检测。';
+    });
     apiKeyInput.addEventListener('keydown', event => { if (event.key === 'Escape' || event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); setKeyEditorOpen(false); document.getElementById('bistu-edit-keys').focus(); } });
     renderKeyInputVisibility(); refreshKeySummary();
     document.getElementById('bistu-settings-reset').addEventListener('click', () => {
@@ -460,9 +460,10 @@
         for (const [key,[,value]] of Object.entries(SETTING_OPTIONS)) document.getElementById('bistu-setting-' + key).value = value;
         for (const [key,value] of Object.entries(MODEL_DEFAULTS)) document.getElementById('bistu-setting-' + key).value = value;
         panel.querySelectorAll('[aria-invalid="true"]').forEach(input => input.removeAttribute('aria-invalid'));
-        clearPanelError(); refreshPanelControls();
+        clearPanelError(); updateGlobalProgress();
         addLog('运行设置已恢复默认；当前 Key 和题目进度保留。', 'info');
     });
+    document.getElementById('bistu-setting-includeHomework').addEventListener('change', updateGlobalProgress);
 
     document.getElementById('bistu-check-keys').addEventListener('click', async () => {
         if (engineRunning || panelOperation !== 'idle') return;
