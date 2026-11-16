@@ -6,11 +6,13 @@
 
 ## 本仓库实际使用的流程
 
-先完成平台详情提取与答案核验，再对确实没有平台答案的题目调用 AI。平台答案和原始参考程序优先；已有平台答案不因导入旧断点或 AI 返回而被覆盖。存在无法识别的非空平台答案时保留警告，不把它当成“没有答案”直接付费生成。
+先完成平台详情提取与答案核验。7.20 默认对非程序题独立作答，再与平台答案比较；程序题仅在确实没有平台参考时生成答案，也可主动选择旧的“只补缺答案”模式。平台答案和原始参考程序不会被 AI 覆盖。存在无法识别的非空平台答案时保留警告，不把它当成“没有答案”直接付费生成。
 
 7.14 使用 `POST https://api.deepseek.com/chat/completions`，非流式、普通文本输出。默认普通题和含图题使用 `deepseek-flash`，无图程序题模型可配置，默认 `deepseek-v4-pro`；含图模型须支持视觉。模型名称和思考模式分别配置，不能继续按旧 `deepseek-chat` / `deepseek-reasoner` 名称推断能力。脚本记录返回的模型名和用量，不把 AI 参考答案标为平台验证结果。
 
-请求显式设置 `thinking.type`、输出预算；思考开启时传 `reasoning_effort`，关闭时才传温度。只有正常结束且有非空最终文本的响应才完成该题；截断、空答案、工具调用和无效响应不作为完成答案。当前没有开启 JSON 输出、工具调用、联网检索、Files 上传、Responses 或 Anthropic Messages。
+请求显式设置 `thinking.type`、输出预算；思考开启时传 `reasoning_effort`，关闭时才传温度。只有正常结束且有非空最终文本的响应才完成该题；截断、空答案、工具调用和无效响应不作为完成答案。7.20 的独立复核流程使用 JSON Object 输出，普通程序答案仍使用文本。未启用工具调用、联网检索、Files 上传、Responses 或 Anthropic Messages。
+
+7.20 于 2026-11-16 重新核对 [JSON Output](https://api-docs.deepseek.com/guides/json_mode/) 和 [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)。独立阶段不提供平台答案，发送原样题面、逐项稳定 ID 和 Java 版本策略；第二阶段提供两份答案及原题，要求解释多解、题面问题及版本条件。解析后核验选项 ID、问题类别、判定枚举和双方支持度。对可明确映射的客观题，ID 不同不能仅因模型声称一致而标为一致；无法机械判断的解释仍是 AI 意见。即使判定一致也保留独立答案供展开，旧复核标识为旧版；版本策略改变使复核缓存失效。测试使用模拟响应，不宣称实际模型正确率提升已经得到量化验证。
 
 默认直接发送题图和题干。需要校内登录的图片先由浏览器读取，再转换为内联 data URL；这是根据官方“外链必须可公开访问”要求作出的实现选择。AI 图片缩放不改离线包原图。本地 OCR 是可选路径，二次 AI 纠错也是可选额外请求。Key 只用于当前运行，不写入断点 ZIP；多个 Key 的轮询不能绕过同账号的服务端额度。
 
@@ -25,7 +27,7 @@
 | 配额 | 并发按账号计算：当前 Flash 2500、Pro 500，直到请求完成才释放。非流式响应可能先发送空行维持连接。脚本设置的是本地并发和等待上限，不是服务端额度保证。 | [Rate Limit](https://api-docs.deepseek.com/quick_start/rate_limit/) |
 | 错误处理 | 401 是认证失败，402 是余额不足，400/422 是请求或参数错误；429、500、503 应等待后重试。有限指数退避、尊重 `Retry-After`、超时后提示可能已计费是本项目的处理策略，不是官方保证的幂等或退款行为。 | [Error Codes](https://api-docs.deepseek.com/quick_start/error_codes/) |
 | 缓存 | 上下文缓存自动开启、尽力命中；当前缓存依赖已持久化的完整前缀单元，首次共享前缀不保证命中。固定公共提示放在前面有利于复用，但不要虚构命中率或节省金额；记录 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`。 | [Context Caching](https://api-docs.deepseek.com/guides/kv_cache/) |
-| JSON 可选能力 | Chat 可设置 `response_format: {type: 'json_object'}`，还需提示中要求 JSON 并给出格式示例。即使 `finish_reason=stop` 也可能只返回空格，需要去空白、解析和业务字段校验。**本项目当前普通文本解答未启用此模式**；Chat 文档的 JSON Object 不能与 Responses 的 JSON Schema 参数混用。 | [JSON Output](https://api-docs.deepseek.com/guides/json_mode/)、[Responses](https://api-docs.deepseek.com/api/create-response/) |
+| JSON 输出 | Chat 可设置 `response_format: {type: 'json_object'}`，还需提示中要求 JSON 并给出格式示例。即使 `finish_reason=stop` 也可能只返回空格，需要去空白、解析和业务字段校验。7.20 独立复核启用此模式；普通程序解答仍为文本。Chat 的 JSON Object 不能与 Responses 的 JSON Schema 参数混用。 | [JSON Output](https://api-docs.deepseek.com/guides/json_mode/)、[Responses](https://api-docs.deepseek.com/api/create-response/) |
 
 官方页面存在需要保留的区别：2026-09-10 的迁移公告说 Pro 名称将路由到 V4.1-Flash，而当前模型/定价页仍列出 Pro。历史公告不能证明当前实际后端模型；应保留返回的模型字段，不宣称不同名称必然使用不同权重。[迁移公告](https://api-docs.deepseek.com/news/news260910/)
 

@@ -2631,7 +2631,10 @@ test('reader geometry stays exact through answers, filters, viewport changes and
   await renderStudyFixture(page,geometryRows());
   const full=await assertReaderGeometry(page,'initial');
   await page.locator('#toggleAnsBtn').click();
-  const hidden=await assertReaderGeometry(page,'all answers hidden');
+  await assertReaderGeometry(page,'answers hidden and practice editors opened');
+  assert.equal(await page.locator('.answer-box:not([hidden])').count(),0);
+  await page.locator('#togglePracticeBtn').click();
+  const hidden=await assertReaderGeometry(page,'answers and practice editors hidden');
   assert.ok(full.height-hidden.height>1000);
   await page.locator('#toggleAnsBtn').click();
   const restored=await assertReaderGeometry(page,'all answers restored');
