@@ -1,0 +1,7 @@
+{
+	"dependencies": {
+		"@noble/ciphers": "2.4.0",
+		"@noble/hashes": "2.4.0",
+		"esbuild": "0.28.2"
+	}
+}

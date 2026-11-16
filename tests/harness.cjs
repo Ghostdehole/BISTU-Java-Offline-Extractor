@@ -20,10 +20,15 @@ function instrument(source) {
       refreshPanelControls: typeof refreshPanelControls === 'function' ? refreshPanelControls : undefined,
       getSettings: typeof getSettings === 'function' ? getSettings : undefined,
       reconcilePlatformAnswer: typeof reconcilePlatformAnswer === 'function' ? reconcilePlatformAnswer : undefined,
+      aiReviewFingerprint: typeof aiReviewFingerprint === 'function' ? aiReviewFingerprint : undefined,
+      getValidAiReview: typeof getValidAiReview === 'function' ? getValidAiReview : undefined,
+      aiOptionCatalog: typeof aiOptionCatalog === 'function' ? aiOptionCatalog : undefined,
       requestDeepSeek: typeof requestDeepSeek === 'function' ? requestDeepSeek : undefined,
       restorePlatformVariables: typeof restorePlatformVariables === 'function' ? restorePlatformVariables : undefined,
       validateImageBuffer: typeof validateImageBuffer === 'function' ? validateImageBuffer : undefined,
       getImageDimensions: buffer => typeof imageDimensions !== 'undefined' ? imageDimensions.get(buffer) : undefined,
+      createImagePack: typeof createImagePack === 'function' ? createImagePack : undefined,
+      bistuCrypto: typeof bistuCrypto !== 'undefined' ? bistuCrypto : undefined,
       parseHomeworkDetail: typeof parseHomeworkDetail === 'function' ? parseHomeworkDetail : undefined,
       homeworkFingerprint: typeof homeworkFingerprint === 'function' ? homeworkFingerprint : undefined,
       mergeHomeworkQuestions: typeof mergeHomeworkQuestions === 'function' ? mergeHomeworkQuestions : undefined,
@@ -113,7 +118,9 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
     };
     const generate = JSZip.prototype.generateAsync;
     JSZip.prototype.generateAsync = async function(...args) {
-      window.__zips.push(this);
+      // Record user-exported snapshots, not the private one-entry archives used
+      // by the image-pack compressor to obtain DEFLATE bytes.
+      if (this.file('state.json') && this.file('index.html')) window.__zips.push(this);
       return generate.apply(this, args);
     };
     window.Tesseract = { createWorker: async () => ({ recognize: async () => ({ data: { text: 'synthetic OCR text' } }) }) };
@@ -124,6 +131,9 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
     // cases opt in explicitly and supply their own fully synthetic responses.
     if (document.querySelector('#bistu-setting-includeHomework')) __setSettings({ includeHomework: 'disabled' });
     if (document.querySelector('#bistu-setting-answerReviewMode')) __setSettings({ answerReviewMode: 'missing-only' });
+    // Password-protected export has its own cryptographic contract suite. Older
+    // extraction fixtures explicitly retain public export without real secrets.
+    if (document.querySelector('#bistu-setting-exportProtection')) __setSettings({ exportProtection: 'none' });
     __test.initializePlatformVariables();
     __test.state.isPaused = false;
   });

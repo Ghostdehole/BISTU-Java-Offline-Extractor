@@ -294,6 +294,58 @@ test('panel: start, safe pause, snapshot download, resume, final download and ne
   assert.equal(await page.evaluate(() => __test.data.length), 0);
 }));
 
+test('panel: changing protection or either password invalidates old ZIP and repacks without extraction or AI requests', () => withPanel(async page => {
+  const downloads = []; page.on('download',download => downloads.push(download));
+  await page.evaluate(async () => {
+    __test.state.stage = 5; __test.state.isPaused = false;
+    __test.setData([{GlobalUID:0,TopicGuid:'protection-repack-synthetic',QuestionType:'Program',Title:'SYNTHETIC_REPACK_CONTENT',DetailHtml:'<p>SYNTHETIC_REPACK_CONTENT</p>',SniffedAnswer:'class SyntheticRepack {}',AnswerSource:'platform-reference',s2_done:true,s3_done:true}]);
+    window.__repackStageEntries=0;
+    for(let stage=1;stage<=4;stage++) __test.setEngineStage(stage,async()=>{__repackStageEntries++;throw Error('Repack must never enter extraction stages');});
+    window.__repackFetches=0; window.__fetch=async()=>{__repackFetches++;throw Error('Repack must never call external APIs');};
+    await __test.buildZipAndDownload(true);
+  });
+  assert.equal(await page.evaluate(()=>__zips.length),1);
+  await page.locator('#bistu-tab-settings').click();
+  await page.locator('#bistu-setting-exportProtection').selectOption('password');
+  assert.equal(await page.locator('#bistu-download-btn').textContent(),'重新生成 ZIP');
+  await page.locator('#bistu-export-password').fill('Synthetic first export password');
+  await page.locator('#bistu-export-password-confirm').fill('Synthetic first export password');
+  await page.locator('#bistu-download-btn').click();
+  await page.waitForFunction(()=>__zips.length===2&&!document.getElementById('bistu-download-btn').disabled);
+  assert.match(await page.locator('#bistu-global-status').textContent(),/已提取 1 题/);
+  assert.equal(downloads.length,0,'repack action cannot download the stale public blob');
+  const encrypted = await page.evaluate(async()=>({state:JSON.parse(await __zips.at(-1).file('state.json').async('string')),html:await __zips.at(-1).file('index.html').async('string')}));
+  assert.equal(encrypted.state.format,'bistu-encrypted');
+  assert.ok(!encrypted.html.includes('SYNTHETIC_REPACK_CONTENT'));
+  await page.locator('#bistu-export-password').fill('Synthetic second export password');
+  assert.equal(await page.locator('#bistu-download-btn').textContent(),'重新生成 ZIP');
+  await page.locator('#bistu-download-btn').click();
+  assert.match(await page.locator('#bistu-feedback').textContent(),/不一致/);
+  assert.equal(await page.evaluate(()=>__zips.length),2);
+  await page.locator('#bistu-export-password-confirm').fill('Synthetic second export password');
+  await page.locator('#bistu-download-btn').click();
+  await page.waitForFunction(()=>__zips.length===3&&!document.getElementById('bistu-download-btn').disabled);
+  const result=await page.evaluate(async()=>{
+    const envelope=JSON.parse(await __zips.at(-1).file('state.json').async('string'));
+    let oldRejected=false;try{await __test.bistuCrypto.decryptText(envelope,'Synthetic first export password','state');}catch(_){oldRejected=true;}
+    const state=JSON.parse((await __test.bistuCrypto.decryptText(envelope,'Synthetic second export password','state')).text);
+    return {oldRejected,title:state.allData[0].Title,serialized:JSON.stringify(state)};
+  });
+  assert.equal(result.oldRejected,true);assert.equal(result.title,'SYNTHETIC_REPACK_CONTENT');
+  assert.ok(!result.serialized.includes('Synthetic second export password')&&!result.serialized.includes('protectionRevision'));
+  await page.locator('#bistu-export-password-confirm').fill('Different confirmation only');
+  assert.equal(await page.locator('#bistu-download-btn').textContent(),'重新生成 ZIP');
+  await page.locator('#bistu-setting-exportProtection').selectOption('none');
+  await page.locator('#bistu-download-btn').click();
+  await page.waitForFunction(()=>__zips.length===4&&!document.getElementById('bistu-download-btn').disabled);
+  assert.equal(await page.evaluate(async()=>JSON.parse(await __zips.at(-1).file('state.json').async('string')).allData[0].Title),'SYNTHETIC_REPACK_CONTENT');
+  const event=page.waitForEvent('download');await page.locator('#bistu-download-btn').click();await event;
+  assert.equal(downloads.length,1);
+  assert.deepEqual(await page.evaluate(()=>({stages:__repackStageEntries,fetches:__repackFetches,platform:__ajaxCalls.length})),{stages:0,fetches:0,platform:0});
+  await page.locator('#bistu-settings-reset').click();
+  assert.equal(await page.locator('#bistu-download-btn').textContent(),'重新生成 ZIP');
+}));
+
 test('panel: a broken import reports visibly and a later snapshot replaces stale completion progress', () => withPanel(async page => {
   const errors=[]; page.on('pageerror',error=>errors.push(error.message));
   const chooser=page.waitForEvent('filechooser'); await page.locator('#bistu-import-btn').click();
