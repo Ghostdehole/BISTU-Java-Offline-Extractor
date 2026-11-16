@@ -84,7 +84,10 @@ test('locked HTML embeds only ciphertext and disables password autofill without 
   });
   const html = await build();
   assert.ok(!html.includes('PRIVATE_SYNTHETIC_READER') && !html.includes(password));
-  assert.match(html, /id="unlockPassword" type="password" autocomplete="off"/);
+  const passwordInputs = [...html.matchAll(/<input\b(?:[^>"']|"[^"]*"|'[^']*')*>/g)].map(match => match[0]).filter(input => /\bid="unlockPassword"/.test(input));
+  assert.equal(passwordInputs.length,1);
+  assert.match(passwordInputs[0], /\btype="password"/);
+  assert.match(passwordInputs[0], /\bautocomplete="off"/);
   assert.doesNotMatch(html,/localStorage|sessionStorage|indexedDB|document\.cookie/);
   assert.match(html,/password\.value = ''/);
 });

@@ -118,7 +118,7 @@ test('encrypted pack decrypts each image independently and rejects wrong keys, m
 test('ZIP export binds its versioned pack and protects reader/state/report while keeping exact original-image backups',async()=>{
   for (const exportProtection of ['none','password']) {
     const ctx=builder(),secret='QUESTION_OPTION_ANSWER_SENTINEL',password='synthetic-export-password';
-    Object.assign(ctx,{Blob,URL,SCRIPT_VERSION:'synthetic',panelOperation:'idle',engineRunning:false,
+    Object.assign(ctx,{Blob,URL,SCRIPT_VERSION:'synthetic',panelOperation:'idle',engineRunning:false,exportProtectionRevision:0,
       latestPackage:null,taskHasStarted:false,imgCounter:2,globalState:{stage:5},allData:[{Title:secret,Answer:secret}],
       getSettings:()=>({exportProtection}),getExportPassword:()=>password,homeworkEnabled:()=>false,
       refreshPanelControls:()=>{},addLog:()=>{},getFormattedTime:()=> 'synthetic',
@@ -151,5 +151,6 @@ test('ZIP export binds its versioned pack and protects reader/state/report while
     assert.equal(report.imagePack.id,pack.id);assert.equal(report.imagePack.file,packName);
     assert.ok(readerHtml.includes('data-pack-id="'+pack.id+'"'));assert.ok(readerHtml.includes(secret));
     assert.equal(ctx.panelOperation,'idle');assert.equal(ctx.latestPackage.isFinal,true);
+    assert.equal(ctx.latestPackage.protectionRevision,0);assert.equal(ctx.latestPackage.current,true);assert.equal(ctx.latestPackage.protectionStale,false);
   }
 });
