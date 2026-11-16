@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.18.0
+// @version      7.19.1
 // @description  练习优先，作业补题去重；题干、选项与原图离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.18.0'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.19.1'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -60,6 +60,10 @@
     const imageDimensions = new WeakMap();
     let imgCounter = 1;
     let engineRunning = false;
+    let panelOperation = 'idle';
+    let panelError = null;
+    let taskHasStarted = false;
+    let latestPackage = null;
     let ocrWorkerPromise = null;
     let dependencyPromise = null;
     let ocrWorker = null;
@@ -94,32 +98,50 @@
     };
     const MODEL_DEFAULTS = { model: 'deepseek-flash', programModel: 'deepseek-v4-pro', visionModel: 'deepseek-flash' };
     function settingsMarkup() {
-        const numeric = Object.entries(SETTING_FIELDS).map(([key,[label,value,min,max,step]]) => `<label>${label}<input id="bistu-setting-${key}" type="number" value="${value}" min="${min}" max="${max}" step="${step || 1}"></label>`).join('');
-        const options = Object.entries(SETTING_OPTIONS).map(([key,[label,value,choices]]) => `<label>${label}<select id="bistu-setting-${key}">${choices.map(([v,text]) => `<option value="${v}"${v === value ? ' selected' : ''}>${text}</option>`).join('')}</select></label>`).join('');
-        const labels = {model:'普通题模型',programModel:'程序题模型',visionModel:'含图片题模型（须支持视觉）'};
-        const models = Object.entries(MODEL_DEFAULTS).map(([key,value]) => `<label>${labels[key]}<input id="bistu-setting-${key}" value="${value}" list="bistu-model-options" autocomplete="off"></label>`).join('');
-        return `<details id="bistu-settings"><summary>运行设置 · 默认 6 并发</summary><p>先采集练习题，再检查当前作业页面班级与学期下的作业，仅补充不重复的同语言题。练习筛选不限制作业扫描。有 Key 时，默认让非程序题独立作答，再比较平台答案；无平台答案只生成一次。程序题（含英文）保留平台优先，确认没有平台答案时调用 AI。比较中断后只重试比较。Key 不限数量，去重后按空闲程度与轮询分配；同账号仍共用服务端额度。暂停后可修改设置；扫描中的每页题数沿用断点。</p><div class="bistu-settings-grid">${models}${options}${numeric}</div><datalist id="bistu-model-options"><option value="deepseek-flash"><option value="deepseek-v4-pro"></datalist><p>平台作答提交不自动重试。多选组合最多为 2ⁿ−1，调高上限会显著增加请求。双阶段复核会增加调用与费用；平台答案始终保留。图片原文件始终保留；缩放仅用于 AI 输入。思考模式忽略温度。</p><button type="button" id="bistu-settings-reset">恢复默认设置</button></details>`;
+        const modelLabels = {model:'普通题模型',programModel:'程序题模型',visionModel:'含图片题模型（须支持视觉）'};
+        const field = key => {
+            const id = 'bistu-setting-' + key;
+            if (SETTING_FIELDS[key]) {
+                const [label,value,min,max,step] = SETTING_FIELDS[key];
+                return `<label class="bistu-field" for="${id}"><span>${label}</span><input id="${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step || 1}"></label>`;
+            }
+            if (SETTING_OPTIONS[key]) {
+                const [label,value,choices] = SETTING_OPTIONS[key];
+                return `<label class="bistu-field" for="${id}"><span>${label}</span><select id="${id}">${choices.map(([v,text]) => `<option value="${v}"${v === value ? ' selected' : ''}>${text}</option>`).join('')}</select></label>`;
+            }
+            return `<label class="bistu-field" for="${id}"><span>${modelLabels[key]}</span><input id="${id}" value="${MODEL_DEFAULTS[key]}" list="bistu-model-options" autocomplete="off" spellcheck="false"></label>`;
+        };
+        const groups = [
+            ['采集范围与平台', '练习页筛选决定练习范围；作业按当前班级、学期与语言补题，重复题保留练习内容。', ['includeHomework','pageSize','listConcurrency','detailConcurrency','multipleMaxOptions','platformTimeoutMs','platformAttempts','platformDelayMs','platformRetryDelayMs']],
+            ['模型选择', '程序题优先保留平台参考程序；没有平台答案时才调用 AI。', ['model','programModel','visionModel']],
+            ['AI 解答与复核', '默认让非程序题独立作答，再比较平台答案。平台答案始终保留，复核会增加调用与费用；思考模式不使用温度。', ['answerReviewMode','thinking','reasoningEffort','maxTokens','temperature']],
+            ['AI 请求调度', '多个 Key 按空闲程度与轮询分配，同一账号仍共用服务端额度。', ['aiConcurrency','perKeyConcurrency','aiTimeoutMs','aiAttempts','aiRetryDelayMs','aiMaxRetryDelayMs','aiRequestIntervalMs']],
+            ['题图与 OCR', '离线原图保持原文件；最长边设置只影响 AI 输入。OCR 纠错开启后会增加一次调用。', ['imageMode','ocrClean','imageConcurrency','imageTimeoutMs','imageAttempts','imageRetryDelayMs','imageDecodeTimeoutMs','imageMaxDimension','ocrTimeoutMs']],
+            ['断点与面板', '暂停后可调整设置；已开始扫描的每页题数沿用断点。Key 不写入断点。', ['resumeSettings','dependencyTimeoutMs','logLimit']]
+        ];
+        return `<details id="bistu-settings" open><summary><span>运行参数</span><span class="bistu-summary-meta">36 项 · 按任务分组</span></summary><div class="bistu-settings-content">${groups.map(([title,description,keys]) => `<fieldset class="bistu-setting-group"><legend>${title}</legend><p class="bistu-help">${description}</p><div class="bistu-settings-grid">${keys.map(field).join('')}</div></fieldset>`).join('')}<p class="bistu-help bistu-setting-note">平台作答提交不自动重试。多选组合最多为 2ⁿ−1，调高选项上限会显著增加请求。</p><button type="button" id="bistu-settings-reset" class="bistu-button bistu-button-secondary">恢复默认设置</button></div><datalist id="bistu-model-options"><option value="deepseek-flash"><option value="deepseek-v4-pro"></datalist></details>`;
     }
     function getSettings() {
         const settings = {};
+        const invalid = (message, key) => { const error = new Error(message); error.fieldId = 'bistu-setting-' + key; throw error; };
         for (const [key,[label,defaultValue,min,max,step]] of Object.entries(SETTING_FIELDS)) {
             const input = document.getElementById('bistu-setting-' + key);
             const raw = input ? input.value.trim() : String(defaultValue);
             const value = Number(raw);
-            if (!raw || !Number.isFinite(value) || value < min || value > max || (!step && !Number.isInteger(value))) throw new Error(`${label} 必须在 ${min}–${max} 范围内${step ? '' : '且为整数'}。`);
+            if (!raw || !Number.isFinite(value) || value < min || value > max || (!step && !Number.isInteger(value))) invalid(`${label} 必须在 ${min}–${max} 范围内${step ? '' : '且为整数'}。`, key);
             settings[key] = value;
         }
         for (const [key,[label,defaultValue,choices]] of Object.entries(SETTING_OPTIONS)) {
             const value = document.getElementById('bistu-setting-' + key)?.value ?? defaultValue;
-            if (!choices.some(([v]) => value === v)) throw new Error(`${label} 无效。`);
+            if (!choices.some(([v]) => value === v)) invalid(`${label} 无效。`, key);
             settings[key] = key === 'ocrClean' ? value === 'true' : value;
         }
         for (const [key,defaultValue] of Object.entries(MODEL_DEFAULTS)) {
             const value = (document.getElementById('bistu-setting-' + key)?.value ?? defaultValue).trim();
-            if (!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(value)) throw new Error('模型名称无效。');
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(value)) invalid('模型名称无效。', key);
             settings[key] = value;
         }
-        if (settings.aiMaxRetryDelayMs < settings.aiRetryDelayMs) throw new Error('AI 退避上限不能小于基础间隔。');
+        if (settings.aiMaxRetryDelayMs < settings.aiRetryDelayMs) invalid('AI 退避上限不能小于基础间隔。', 'aiMaxRetryDelayMs');
         return settings;
     }
     function setSettingsDisabled(disabled) {
@@ -140,17 +162,18 @@
         }
     }
 
+    function parseApiKeys(text) {
+        // Accept pasted multiline lists with a trailing continuation slash, without
+        // changing characters inside an actual credential or restricting key count.
+        return [...new Set(String(text || '').replace(/\\(?=\s*(?:\r?\n|$))/g, '').split(/[,，;；\s]+/).map(key => key.trim()).filter(Boolean))];
+    }
+
     class ApiKeyManager {
         constructor() { this.keys = []; this.entries = []; this.index = 0; this.cooldownUntil = 0; }
         updateKeys(keyStr) {
-            this.keys = [...new Set(String(keyStr).split(/[,，;；\s]+/).map(k => k.trim()).filter(Boolean))];
+            this.keys = parseApiKeys(keyStr);
             this.entries = this.keys.map((key,index) => ({key,number:index + 1,inFlight:0,disabled:false,nextAt:0}));
             this.index = 0; this.cooldownUntil = 0; globalState.outOfKeys = false;
-        }
-        getKey() {
-            const active = this.entries.filter(entry => !entry.disabled);
-            if (!active.length) return null;
-            return active[this.index++ % active.length].key;
         }
         getCount() { return this.entries.filter(entry => !entry.disabled).length; }
         async acquire() {
@@ -184,76 +207,151 @@
     const panelId = "bistu-extractor-panel";
     if(document.getElementById(panelId)) document.getElementById(panelId).remove();
 
+    function extractorPanelStyles() {
+        return `
+        #bistu-extractor-panel{--bp-bg:#f5f8f8;--bp-surface:#fff;--bp-soft:#eef4f3;--bp-ink:#182d31;--bp-muted:#5a7075;--bp-line:#d9e5e3;--bp-accent:#087f6b;--bp-accent-hover:#076856;--bp-accent-soft:#e1f3ed;--bp-warning:#8f5a0c;--bp-warning-bg:#fff4d8;--bp-error:#b33b42;--bp-error-bg:#fff0f0;--bp-code:#f3f6f6;--bp-shadow:0 16px 50px #102c3526;--bp-info:#376a9a;--bp-ai:#7652a3;--bp-image:#87630e;position:fixed;top:24px;right:24px;width:620px;max-width:calc(100vw - 24px);min-width:min(320px,calc(100vw - 24px));height:min(780px,calc(100dvh - 48px));min-height:min(400px,calc(100dvh - 24px));max-height:calc(100dvh - 24px);display:flex;flex-direction:column;z-index:2147483647;background:var(--bp-bg);color:var(--bp-ink);border:1px solid var(--bp-line);border-radius:16px;box-shadow:var(--bp-shadow);font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;text-align:left;color-scheme:light;isolation:isolate;overflow:visible}
+        #bistu-extractor-panel[data-theme=dark]{--bp-bg:#141e23;--bp-surface:#1b292f;--bp-soft:#22343b;--bp-ink:#e3eeee;--bp-muted:#a0b7bb;--bp-line:#344950;--bp-accent:#63d2b7;--bp-accent-hover:#84e1ca;--bp-accent-soft:#213e39;--bp-warning:#ebc279;--bp-warning-bg:#3b3323;--bp-error:#ffacaf;--bp-error-bg:#422c32;--bp-code:#152329;--bp-shadow:0 16px 50px #0005;--bp-info:#95c4ef;--bp-ai:#c6a8e8;--bp-image:#e0c47e;color-scheme:dark}
+        @media(prefers-color-scheme:dark){#bistu-extractor-panel[data-theme=auto]{--bp-bg:#141e23;--bp-surface:#1b292f;--bp-soft:#22343b;--bp-ink:#e3eeee;--bp-muted:#a0b7bb;--bp-line:#344950;--bp-accent:#63d2b7;--bp-accent-hover:#84e1ca;--bp-accent-soft:#213e39;--bp-warning:#ebc279;--bp-warning-bg:#3b3323;--bp-error:#ffacaf;--bp-error-bg:#422c32;--bp-code:#152329;--bp-shadow:0 16px 50px #0005;--bp-info:#95c4ef;--bp-ai:#c6a8e8;--bp-image:#e0c47e;color-scheme:dark}}
+        #bistu-extractor-panel,#bistu-extractor-panel *{box-sizing:border-box}
+        #bistu-extractor-panel[data-maximized=true]{max-width:none;max-height:none;min-width:0;min-height:0;border-radius:0;box-shadow:none}
+        #bistu-extractor-panel[data-maximized=true] #bistu-extractor-panel-header,#bistu-extractor-panel[data-maximized=true] .bistu-footer{border-radius:0}
+        #bistu-extractor-panel [hidden]{display:none!important}
+        #bistu-extractor-panel h2,#bistu-extractor-panel h3,#bistu-extractor-panel p{margin:0;color:inherit;font-family:inherit}
+        #bistu-extractor-panel button,#bistu-extractor-panel input,#bistu-extractor-panel select,#bistu-extractor-panel textarea{font:inherit;letter-spacing:normal;text-transform:none;box-shadow:none}
+        #bistu-extractor-panel button{appearance:none;cursor:pointer;line-height:1.35}
+        #bistu-extractor-panel button:disabled,#bistu-extractor-panel input:disabled,#bistu-extractor-panel select:disabled,#bistu-extractor-panel textarea:disabled{opacity:.52;cursor:not-allowed}
+        #bistu-extractor-panel :focus-visible{outline:3px solid var(--bp-accent);outline-offset:3px}
+        #bistu-extractor-panel .bistu-sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+        #bistu-extractor-panel-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;flex:none;padding:18px 20px 14px;background:var(--bp-surface);border-radius:15px 15px 0 0;cursor:move;user-select:none}
+        #bistu-extractor-panel .bistu-brand{min-width:0;display:flex;gap:11px;align-items:center}
+        #bistu-extractor-panel .bistu-brand-mark{width:36px;height:36px;border:1px solid var(--bp-line);border-radius:11px;display:grid;place-items:center;flex:none;background:var(--bp-accent-soft);color:var(--bp-accent);font-size:17px;font-weight:750}
+        #bistu-extractor-panel h2{font-size:16px;line-height:1.35;font-weight:700}
+        #bistu-extractor-panel .bistu-version{display:block;color:var(--bp-muted);font-size:11px;margin-top:3px;font-weight:400}
+        #bistu-extractor-panel .bistu-header-tools{display:flex;gap:7px;align-items:center;flex:none}
+        #bistu-extractor-panel .bistu-header-tools select{width:auto;max-width:118px;font-size:11px;min-height:33px;padding:6px 24px 6px 9px}
+        #bistu-extractor-panel .bistu-button{min-height:36px;border-radius:8px;padding:8px 12px;border:1px solid transparent;background:var(--bp-accent);color:var(--bp-surface);font-weight:650;font-size:12px;text-decoration:none;white-space:normal}
+        #bistu-extractor-panel .bistu-button:hover:not(:disabled){background:var(--bp-accent-hover)}
+        #bistu-extractor-panel .bistu-button-secondary{background:var(--bp-surface);color:var(--bp-ink);border-color:var(--bp-line)}
+        #bistu-extractor-panel .bistu-button-secondary:hover:not(:disabled){background:var(--bp-soft);border-color:var(--bp-muted)}
+        #bistu-extractor-panel .bistu-button-quiet{background:transparent;color:var(--bp-muted);border-color:transparent;padding:6px 9px;font-weight:500;min-height:33px}
+        #bistu-extractor-panel .bistu-button-quiet:hover:not(:disabled){background:var(--bp-soft);color:var(--bp-ink)}
+        #bistu-extractor-panel .bistu-status-region{padding:0 20px 16px;flex:none;background:var(--bp-surface);border-bottom:1px solid var(--bp-line)}
+        #bistu-extractor-panel .bistu-status-row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin:0 0 10px}
+        #bistu-global-status{font-size:12px;font-weight:600;overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-time-progress{display:flex;gap:12px;flex:none;font:11px/1.7 ui-monospace,Consolas,monospace;color:var(--bp-muted);font-variant-numeric:tabular-nums}
+        #bistu-global-percent{color:var(--bp-accent);font-weight:700}
+        #bistu-extractor-panel .bistu-progress-track{height:6px;background:var(--bp-soft);border-radius:9px;overflow:hidden}
+        #bistu-global-progress{height:100%;width:0;background:var(--bp-accent);border-radius:inherit}
+        #bistu-extractor-panel[data-state=error] #bistu-global-status{color:var(--bp-error)}
+        #bistu-extractor-panel[data-state=paused] #bistu-global-status,#bistu-extractor-panel[data-state=stopping] #bistu-global-status{color:var(--bp-warning)}
+        #bistu-extractor-panel[data-state=complete] #bistu-global-status{color:var(--bp-accent)}
+        #bistu-feedback{margin:10px 16px 0;padding:9px 12px;max-height:100px;overflow:auto;flex:none;border:1px solid currentColor;border-radius:8px;background:var(--bp-error-bg);color:var(--bp-error);font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-tabs{display:flex;flex:none;gap:3px;padding:10px 16px 0;border-bottom:1px solid var(--bp-line);background:var(--bp-surface)}
+        #bistu-extractor-panel .bistu-tab{position:relative;flex:1;padding:10px 8px 12px;min-height:40px;background:transparent;border:0;border-radius:6px 6px 0 0;color:var(--bp-muted);font-weight:600;font-size:12px}
+        #bistu-extractor-panel .bistu-tab[aria-selected=true]{color:var(--bp-accent);background:var(--bp-bg)}
+        #bistu-extractor-panel .bistu-tab[aria-selected=true]:after{content:"";position:absolute;bottom:-1px;left:20%;right:20%;height:2px;background:var(--bp-accent)}
+        #bistu-extractor-panel .bistu-tab:hover{color:var(--bp-ink);background:var(--bp-soft)}
+        #bistu-workspace{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:18px}
+        #bistu-extractor-panel .bistu-tab-panel{min-width:0}
+        #bistu-extractor-panel .bistu-section-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+        #bistu-extractor-panel h3{font-size:13px;font-weight:650}
+        #bistu-extractor-panel .bistu-help{font-size:11px;line-height:1.7;color:var(--bp-muted);overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100px,100%),1fr));gap:9px;margin-bottom:18px}
+        #bistu-extractor-panel .bistu-metric{min-width:0;border:1px solid var(--bp-line);border-radius:10px;padding:13px 11px;background:var(--bp-surface)}
+        #bistu-extractor-panel .bistu-metric strong{display:block;font-size:22px;line-height:1.2;color:var(--bp-ink);font-weight:650;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-metric span{display:block;font-size:10px;color:var(--bp-muted);margin-top:6px}
+        #bistu-extractor-panel .bistu-stage-list{display:grid;gap:0;list-style:none;margin:0;padding:0;border:1px solid var(--bp-line);border-radius:11px;overflow:hidden;background:var(--bp-surface)}
+        #bistu-extractor-panel .bistu-stage{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:10px;padding:13px 14px;align-items:start}
+        #bistu-extractor-panel .bistu-stage+.bistu-stage{border-top:1px solid var(--bp-line)}
+        #bistu-extractor-panel .bistu-stage-icon{grid-row:1/3;display:grid;place-items:center;width:26px;height:26px;border-radius:50%;border:1px solid var(--bp-line);color:var(--bp-muted);background:var(--bp-bg);font:11px/1 ui-monospace,Consolas,monospace}
+        #bistu-extractor-panel .bistu-stage-title{font-size:12px;font-weight:600}
+        #bistu-extractor-panel .bistu-stage-value{font-size:11px;line-height:1.6;color:var(--bp-muted);margin-top:3px;overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-stage[data-state=active],#bistu-extractor-panel .bistu-stage[data-state=running]{background:var(--bp-accent-soft)}
+        #bistu-extractor-panel .bistu-stage[data-state=active] .bistu-stage-icon,#bistu-extractor-panel .bistu-stage[data-state=running] .bistu-stage-icon,#bistu-extractor-panel .bistu-stage[data-state=done] .bistu-stage-icon{border-color:var(--bp-accent);color:var(--bp-accent);background:var(--bp-accent-soft)}
+        #bistu-homework-status{margin-top:13px;padding:11px 13px;border-radius:8px;background:var(--bp-soft);font-size:11px;line-height:1.7;color:var(--bp-muted);overflow-wrap:anywhere}
+        #bistu-extractor-panel .bistu-overview-footnote{margin-top:13px}
+        #bistu-apikey-container{padding:15px;border:1px solid var(--bp-line);border-radius:11px;background:var(--bp-surface);margin-bottom:14px}
+        #bistu-extractor-panel .bistu-key-summary{display:flex;justify-content:space-between;align-items:center;gap:12px}
+        #bistu-key-count{display:block;color:var(--bp-muted);font-size:11px;margin-top:5px}
+        #bistu-keys-editor{margin-top:13px;padding-top:13px;border-top:1px solid var(--bp-line)}
+        #bistu-extractor-panel .bistu-key-label{display:block;font-size:11px;font-weight:600;margin-bottom:6px}
+        #bistu-apikey{display:block;width:100%;min-height:92px;height:100px;resize:vertical;font:12px/1.65 ui-monospace,Consolas,monospace}
+        #bistu-extractor-panel .bistu-key-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}
+        #bistu-key-status{display:block;margin-top:10px;color:var(--bp-muted);font-size:11px;line-height:1.6;overflow-wrap:anywhere}
+        #bistu-settings{margin:0;border:1px solid var(--bp-line);border-radius:11px;background:var(--bp-surface)}
+        #bistu-settings>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;padding:14px 15px;font-size:13px;font-weight:650;list-style:none}
+        #bistu-settings>summary::-webkit-details-marker{display:none}
+        #bistu-settings>summary:after{content:"+";font:18px/1 ui-monospace,Consolas,monospace;color:var(--bp-muted)}
+        #bistu-settings[open]>summary:after{content:"−"}
+        #bistu-extractor-panel .bistu-summary-meta{margin-left:auto;font-size:10px;font-weight:400;color:var(--bp-muted)}
+        #bistu-extractor-panel .bistu-settings-content{padding:0 15px 15px}
+        #bistu-extractor-panel .bistu-setting-group{border:0;border-top:1px solid var(--bp-line);padding:14px 0 17px;margin:0;min-width:0}
+        #bistu-extractor-panel .bistu-setting-group legend{width:auto;float:none;margin:0;padding:0 8px 0 0;border:0;color:var(--bp-ink);font-size:12px;font-weight:650;line-height:1.5}
+        #bistu-extractor-panel .bistu-setting-group>.bistu-help{margin:-2px 0 12px}
+        #bistu-extractor-panel .bistu-settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:13px 12px}
+        #bistu-extractor-panel .bistu-field{display:flex;flex-direction:column;gap:6px;min-width:0;margin:0;font-size:11px;font-weight:400;color:var(--bp-muted)}
+        #bistu-extractor-panel input:not([type=checkbox]):not([type=file]),#bistu-extractor-panel select,#bistu-extractor-panel textarea{appearance:auto;max-width:100%;min-width:0;background:var(--bp-surface);color:var(--bp-ink);border:1px solid var(--bp-line);border-radius:7px;padding:8px 9px;line-height:1.4;margin:0}
+        #bistu-extractor-panel .bistu-field input,#bistu-extractor-panel .bistu-field select{width:100%;min-height:37px;font-size:12px}
+        #bistu-extractor-panel input::placeholder,#bistu-extractor-panel textarea::placeholder{color:var(--bp-muted);opacity:.85}
+        #bistu-extractor-panel .bistu-setting-note{padding-top:5px;margin-bottom:13px}
+        #bistu-panel-logs{display:flex;flex-direction:column;height:100%;min-height:180px}
+        #bistu-extractor-panel .bistu-log-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:7px;flex:none;margin-bottom:10px}
+        #bistu-extractor-panel .bistu-log-toolbar select{font-size:11px;width:auto;min-height:34px;padding:6px 8px}
+        #bistu-extractor-panel .bistu-log-follow{display:flex;align-items:center;gap:5px;margin:0 auto 0 0;font-size:11px;font-weight:400;color:var(--bp-muted);white-space:nowrap}
+        #bistu-log-follow{appearance:auto;width:14px;height:14px;margin:0;accent-color:var(--bp-accent)}
+        #bistu-extractor-panel-log{min-height:120px;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;background:var(--bp-code);border:1px solid var(--bp-line);border-radius:9px;padding:11px 12px;color:var(--bp-muted);font:11px/1.75 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+        #bistu-extractor-panel-log>div{font:inherit;line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 5px}
+        #bistu-extractor-panel-log [data-level=error],#bistu-extractor-panel-log [data-type=error]{color:var(--bp-error)}
+        #bistu-extractor-panel-log [data-level=warning],#bistu-extractor-panel-log [data-type=warning]{color:var(--bp-warning)}
+        #bistu-extractor-panel-log [data-level=success],#bistu-extractor-panel-log [data-type=success]{color:var(--bp-accent)}
+        #bistu-extractor-panel-log [data-level=scan],#bistu-extractor-panel-log [data-type=scan]{color:var(--bp-info)}
+        #bistu-extractor-panel-log [data-level=ai],#bistu-extractor-panel-log [data-type=ai]{color:var(--bp-ai)}
+        #bistu-extractor-panel-log [data-level=image],#bistu-extractor-panel-log [data-type=image]{color:var(--bp-image)}
+        #bistu-extractor-panel .bistu-footer{display:flex;flex-wrap:wrap;gap:8px;flex:none;padding:13px 18px 15px;background:var(--bp-surface);border-top:1px solid var(--bp-line);border-radius:0 0 15px 15px}
+        #bistu-init-actions,#bistu-run-actions{display:flex;gap:9px;align-items:stretch;flex-wrap:wrap}
+        #bistu-init-actions{flex:1;order:1}
+        #bistu-run-actions{flex:1 0 100%;order:0}
+        #bistu-init-actions>.bistu-button,#bistu-run-actions>.bistu-button{flex:1;min-height:41px;min-width:100px}
+        #bistu-new-task{margin:0;order:2}
+        #bistu-extractor-panel[data-state=running] #bistu-pause-btn{background:var(--bp-warning-bg);border-color:var(--bp-warning);color:var(--bp-warning)}
+        #bistu-extractor-panel .panel-resizer{position:absolute;z-index:10;touch-action:none}
+        #bistu-extractor-panel .panel-resizer.n,#bistu-extractor-panel .panel-resizer.s{height:10px;left:12px;right:12px}
+        #bistu-extractor-panel .panel-resizer.n{top:0;cursor:n-resize}#bistu-extractor-panel .panel-resizer.s{bottom:0;cursor:s-resize}
+        #bistu-extractor-panel .panel-resizer.e,#bistu-extractor-panel .panel-resizer.w{width:10px;top:12px;bottom:12px}
+        #bistu-extractor-panel .panel-resizer.e{right:0;cursor:e-resize}#bistu-extractor-panel .panel-resizer.w{left:0;cursor:w-resize}
+        #bistu-extractor-panel .panel-resizer.nw,#bistu-extractor-panel .panel-resizer.ne,#bistu-extractor-panel .panel-resizer.sw,#bistu-extractor-panel .panel-resizer.se{width:16px;height:16px;z-index:11}
+        #bistu-extractor-panel .panel-resizer.nw{top:0;left:0;cursor:nw-resize}#bistu-extractor-panel .panel-resizer.ne{top:0;right:0;cursor:ne-resize}#bistu-extractor-panel .panel-resizer.sw{bottom:0;left:0;cursor:sw-resize}#bistu-extractor-panel .panel-resizer.se{bottom:0;right:0;cursor:se-resize}
+        @media(max-width:520px){#bistu-extractor-panel{top:12px;right:12px;height:calc(100dvh - 24px)}#bistu-extractor-panel-header{padding:13px 13px 10px;gap:7px}#bistu-extractor-panel .bistu-brand{gap:8px}#bistu-extractor-panel .bistu-brand-mark{width:30px;height:30px;border-radius:9px;font-size:14px}#bistu-extractor-panel h2{font-size:14px}#bistu-extractor-panel .bistu-header-tools{gap:3px}#bistu-extractor-panel .bistu-header-tools select{max-width:94px;font-size:10px;padding:6px}#bistu-fullscreen-btn{font-size:10px;padding:6px!important}#bistu-extractor-panel .bistu-status-region{padding:0 13px 12px}#bistu-extractor-panel .bistu-tabs{padding:7px 10px 0}#bistu-workspace{padding:13px}#bistu-extractor-panel .bistu-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}#bistu-extractor-panel .bistu-metric{padding:10px 11px}#bistu-extractor-panel .bistu-metric strong{font-size:20px}#bistu-extractor-panel .bistu-settings-grid{grid-template-columns:1fr}#bistu-extractor-panel .bistu-footer{padding:11px 13px}#bistu-extractor-panel .bistu-time-progress{gap:7px;font-size:10px}#bistu-extractor-panel .bistu-summary-meta{font-size:9px}}
+        @media(pointer:coarse){#bistu-extractor-panel button,#bistu-extractor-panel select{min-height:40px}#bistu-extractor-panel .bistu-field input,#bistu-apikey{font-size:16px}}
+        @media(forced-colors:active){#bistu-extractor-panel{border:2px solid CanvasText;box-shadow:none}#bistu-extractor-panel .bistu-tab[aria-selected=true]{outline:2px solid Highlight;outline-offset:-3px}}
+        `;
+    }
+
     const panelHTML = `
-        <div id="${panelId}" style="position:fixed; top:20px; right:20px; width:560px; max-width:calc(100vw - 24px); min-width:320px; min-height:500px; height:720px; background:rgba(25, 25, 25, 0.95); backdrop-filter:blur(10px); border-radius:12px; box-shadow:0 12px 36px rgba(0,0,0,0.6); z-index:2147483647; display:flex; flex-direction:column; font-family:'Microsoft YaHei', Consolas, sans-serif; border: 1px solid #444; overflow: visible;">
-
-            <div class="panel-resizer n" style="position:absolute; top:-5px; left:10px; right:10px; height:10px; cursor:n-resize; z-index:10;"></div>
-            <div class="panel-resizer s" style="position:absolute; bottom:-5px; left:10px; right:10px; height:10px; cursor:s-resize; z-index:10;"></div>
-            <div class="panel-resizer e" style="position:absolute; top:10px; bottom:10px; right:-5px; width:10px; cursor:e-resize; z-index:10;"></div>
-            <div class="panel-resizer w" style="position:absolute; top:10px; bottom:10px; left:-5px; width:10px; cursor:w-resize; z-index:10;"></div>
-            <div class="panel-resizer nw" style="position:absolute; top:-5px; left:-5px; width:15px; height:15px; cursor:nw-resize; z-index:11;"></div>
-            <div class="panel-resizer ne" style="position:absolute; top:-5px; right:-5px; width:15px; height:15px; cursor:ne-resize; z-index:11;"></div>
-            <div class="panel-resizer sw" style="position:absolute; bottom:-5px; left:-5px; width:15px; height:15px; cursor:sw-resize; z-index:11;"></div>
-            <div class="panel-resizer se" style="position:absolute; bottom:-5px; right:-5px; width:15px; height:15px; cursor:se-resize; z-index:11;"></div>
-
-            <div id="${panelId}-header" style="padding:15px; background:linear-gradient(90deg, #087f68, #055a49); color:white; border-radius:11px 11px 0 0; cursor:move; display:flex; justify-content:space-between; align-items:center; user-select:none; flex-shrink: 0;">
-                <span style="font-weight:bold; font-size:16px;">🎓 BISTU题库提取 <small style="font-size:11px; opacity:.8;">v${SCRIPT_VERSION}</small></span>
-                <button id="bistu-fullscreen-btn" class="bistu-fs-btn">🔲 铺满窗口</button>
+        <section id="${panelId}" data-theme="auto" data-state="ready" data-maximized="false" role="region" aria-labelledby="bistu-panel-title">
+            <div class="panel-resizer n" aria-hidden="true"></div><div class="panel-resizer s" aria-hidden="true"></div><div class="panel-resizer e" aria-hidden="true"></div><div class="panel-resizer w" aria-hidden="true"></div><div class="panel-resizer nw" aria-hidden="true"></div><div class="panel-resizer ne" aria-hidden="true"></div><div class="panel-resizer sw" aria-hidden="true"></div><div class="panel-resizer se" aria-hidden="true"></div>
+            <header id="${panelId}-header"><div class="bistu-brand"><span class="bistu-brand-mark" aria-hidden="true">B</span><div><h2 id="bistu-panel-title">BISTU 题库提取</h2><span class="bistu-version">离线采集工作台 · v${SCRIPT_VERSION}</span></div></div><div class="bistu-header-tools"><label class="bistu-sr-only" for="bistu-theme">面板主题</label><select id="bistu-theme"><option value="auto">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><button type="button" id="bistu-fullscreen-btn" class="bistu-button bistu-button-quiet">铺满窗口</button></div></header>
+            <section class="bistu-status-region" aria-label="任务状态"><div class="bistu-status-row"><span id="bistu-global-status" role="status" aria-live="polite">准备就绪</span><div class="bistu-time-progress"><span id="bistu-global-timer" aria-label="运行时间">00:00</span><span id="bistu-global-percent">0.0%</span></div></div><div class="bistu-progress-track" role="progressbar" aria-label="整体提取进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bistu-global-progress"></div></div></section>
+            <div id="bistu-feedback" role="alert" hidden></div>
+            <nav class="bistu-tabs" role="tablist" aria-label="提取工作区"><button type="button" id="bistu-tab-overview" class="bistu-tab" role="tab" aria-selected="true" aria-controls="bistu-panel-overview" tabindex="0">任务概览</button><button type="button" id="bistu-tab-settings" class="bistu-tab" role="tab" aria-selected="false" aria-controls="bistu-panel-settings" tabindex="-1">API 与设置</button><button type="button" id="bistu-tab-logs" class="bistu-tab" role="tab" aria-selected="false" aria-controls="bistu-panel-logs" tabindex="-1">运行日志</button></nav>
+            <div id="bistu-workspace">
+                <section id="bistu-panel-overview" class="bistu-tab-panel" role="tabpanel" aria-labelledby="bistu-tab-overview" tabindex="0">
+                    <div class="bistu-metrics"><div class="bistu-metric"><strong id="bistu-metric-questions">0</strong><span>已收集题目</span></div><div class="bistu-metric"><strong id="bistu-metric-images">0</strong><span>已保存图片</span></div><div class="bistu-metric"><strong id="bistu-metric-ai">0</strong><span>AI 已处理</span></div><div class="bistu-metric"><strong id="bistu-metric-keys">0</strong><span>已配置 Key</span></div></div>
+                    <div class="bistu-section-heading"><h3>采集流程</h3><button type="button" id="bistu-open-settings" class="bistu-button bistu-button-quiet">调整设置</button></div>
+                    <ol class="bistu-stage-list"><li id="bistu-step-1" class="bistu-stage" data-state="waiting"><span id="bistu-stage-icon-1" class="bistu-stage-icon" aria-hidden="true">1</span><span class="bistu-stage-title">扫描练习题库</span><span id="bistu-val-1" class="bistu-stage-value">等待开始</span></li><li id="bistu-step-2" class="bistu-stage" data-state="waiting"><span id="bistu-stage-icon-2" class="bistu-stage-icon" aria-hidden="true">2</span><span class="bistu-stage-title">提取内容与核对作业</span><span id="bistu-val-2" class="bistu-stage-value">保留平台答案，作业只补缺题</span></li><li id="bistu-step-3" class="bistu-stage" data-state="waiting"><span id="bistu-stage-icon-3" class="bistu-stage-icon" aria-hidden="true">3</span><span class="bistu-stage-title">AI 解答与答案复核</span><span id="bistu-val-3" class="bistu-stage-value">可选，未配置 Key 时跳过</span></li><li id="bistu-step-4" class="bistu-stage" data-state="waiting"><span id="bistu-stage-icon-4" class="bistu-stage-icon" aria-hidden="true">4</span><span class="bistu-stage-title">保存原图与打包</span><span id="bistu-val-4" class="bistu-stage-value">原图下载完成后导出 ZIP</span></li></ol>
+                    <p id="bistu-homework-status">练习优先，按当前作业页的班级、学期与语言检查作业。重复题会关联作业来源，题库不重复收录。</p><p class="bistu-help bistu-overview-footnote">开始前可调整练习页筛选。运行中可安全暂停并保存断点，之后导入 ZIP 继续。</p>
+                </section>
+                <section id="bistu-panel-settings" class="bistu-tab-panel" role="tabpanel" aria-labelledby="bistu-tab-settings" tabindex="0" hidden>
+                    <section id="bistu-apikey-container" aria-labelledby="bistu-api-title"><div class="bistu-key-summary"><div><h3 id="bistu-api-title">DeepSeek API</h3><span id="bistu-key-count">尚未配置 Key · AI 可选</span></div><button type="button" id="bistu-edit-keys" class="bistu-button bistu-button-secondary" aria-expanded="false" aria-controls="bistu-keys-editor">配置 Key</button></div><div id="bistu-keys-editor" hidden><label for="bistu-apikey" class="bistu-key-label">API Keys</label><textarea id="bistu-apikey" autocomplete="off" spellcheck="false" aria-label="DeepSeek API Keys" placeholder="支持逗号、分号或换行分隔，重复 Key 自动合并。留空跳过 AI。"></textarea><div class="bistu-key-actions"><button type="button" id="bistu-show-keys" class="bistu-button bistu-button-secondary">隐藏 Key 输入区</button><button type="button" id="bistu-check-keys" class="bistu-button bistu-button-secondary">检测 Key</button></div></div><span id="bistu-key-status" role="status">Key 仅保留在当前页面，不写入 ZIP；检测只查询可用状态，不生成答案。</span></section>
+                    ${settingsMarkup()}
+                </section>
+                <section id="bistu-panel-logs" class="bistu-tab-panel" role="tabpanel" aria-labelledby="bistu-tab-logs" tabindex="0" hidden><div class="bistu-log-toolbar"><label class="bistu-sr-only" for="bistu-log-filter">日志级别</label><select id="bistu-log-filter"><option value="all">全部日志</option><option value="warning">提醒与错误</option><option value="error">仅错误</option></select><label class="bistu-log-follow" for="bistu-log-follow"><input type="checkbox" id="bistu-log-follow" checked>跟随最新</label><button type="button" id="bistu-log-copy" class="bistu-button bistu-button-secondary">复制</button><button type="button" id="bistu-log-clear" class="bistu-button bistu-button-secondary">清空</button></div><div id="${panelId}-log" role="log" aria-label="提取日志" aria-live="off" tabindex="0"><div data-level="info">工作台已就绪。请选择开始提取，或导入已有断点。</div></div></section>
             </div>
-
-            <div style="padding: 12px 15px; background: rgba(0,0,0,0.4); flex-shrink: 0;">
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px; color:#ddd;">
-                    <span id="bistu-global-status" style="font-weight:bold;">💤 准备就绪</span>
-                    <div style="display:flex; align-items:center; gap:10px;">
-                        <span id="bistu-global-timer" style="color:#ffb74d; font-family:Consolas, monospace;">⏱️ 00:00</span>
-                        <span id="bistu-global-percent" style="font-weight:bold; color:#4db6ac;">0.0%</span>
-                    </div>
-                </div>
-                <div style="width:100%; background:#111; border-radius:6px; height:12px; overflow:hidden; border: 1px solid #333; box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);">
-                    <div id="bistu-global-progress" style="width:0%; height:100%; background:linear-gradient(90deg, #4db6ac, #087f68); transition:width 0.4s ease-out; position:relative;">
-                        <div style="position:absolute; top:0; left:0; right:0; bottom:0; background:linear-gradient(45deg, rgba(255,255,255,0.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%, transparent); background-size:20px 20px; animation:progress-stripes 1s linear infinite;"></div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="bistu-apikey-container" style="padding:15px; background:rgba(0,0,0,0.3); border-bottom:1px solid #333; flex-shrink:1; min-height:100px; max-height:55%; overflow-y:auto;">
-                <textarea id="bistu-apikey" autocomplete="off" spellcheck="false" aria-label="DeepSeek API Keys" placeholder="DeepSeek API Key：逗号、分号或换行分隔；数量不限，重复项自动合并。留空跳过 AI。" style="width:100%; height:45px; padding:8px; border-radius:4px; border:1px solid #444; background:#1e1e1e; color:#fff; font-size:13px; margin-bottom:10px; box-sizing:border-box; resize:vertical;-webkit-text-security:disc;"></textarea>
-                <div style="display:flex;gap:10px;margin-bottom:10px;align-items:center"><button type="button" id="bistu-show-keys">显示/隐藏 Key</button><button type="button" id="bistu-check-keys">检测 Key（不生成答案）</button><span id="bistu-key-status" style="color:#bbb;font-size:11px">Key 仅保留在当前页面，不写入 ZIP</span></div>
-                ${settingsMarkup()}
-                <div id="bistu-init-actions" style="display:flex; gap:10px;">
-                    <button id="bistu-start-btn" style="flex:1; padding:8px; background:#087f68; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; transition:0.2s;">▶️ 全新开始提取</button>
-                    <button id="bistu-import-btn" style="flex:1; padding:8px; background:#f57c00; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; transition:0.2s;">📂 导入断点 ZIP 继续</button>
-                    <input type="file" id="bistu-file-input" style="display:none" accept=".zip">
-                </div>
-            </div>
-
-            <div style="padding:12px 15px; color:#ccc; font-size:13px; border-bottom:1px solid #333; flex-shrink: 0; background:rgba(0,0,0,0.2);">
-                <div id="bistu-step-1" style="margin-bottom:6px;">⏳ 1. 扫描云端题库: <span id="bistu-val-1" style="color:#4db6ac; font-weight:bold;">等待</span></div>
-                <div id="bistu-step-2" style="margin-bottom:6px;">⏳ 2. 题目、选项与答案验证: <span id="bistu-val-2" style="color:#4db6ac; font-weight:bold;">等待</span></div>
-                <div id="bistu-step-3" style="margin-bottom:6px;">⏳ 3. AI 独立解答与答案复核: <span id="bistu-val-3" style="color:#4db6ac; font-weight:bold;">等待</span></div>
-                <div id="bistu-step-4" style="margin-bottom:2px;">⏳ 4. 图片并发兜底下载: <span id="bistu-val-4" style="color:#4db6ac; font-weight:bold;">等待</span></div>
-            </div>
-
-            <div style="flex-grow:1; background:#0a0a0a; margin:10px; border-radius:6px; padding:12px; overflow-y:auto; border:1px inset #222;" id="${panelId}-log">
-                <div style="color:#4db6ac; font-size:12px; margin-bottom:5px;">[System] 引擎注入成功，日志系统已就绪...</div>
-            </div>
-
-            <div id="bistu-run-actions" style="padding:15px; display:none; gap:10px; background:#111; border-radius:0 0 11px 11px; flex-shrink: 0;">
-                <button id="bistu-pause-btn" style="flex:1; padding:10px; background:#ef5350; color:white; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer; transition:0.3s;">
-                    ⏸️ 暂停并生成防丢 ZIP
-                </button>
-                <button id="bistu-download-btn" style="flex:1; padding:10px; background:#444; color:#999; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:not-allowed;" disabled>
-                    🚧 处理中...
-                </button>
-            </div>
-            <style>
-                #bistu-settings{color:#ddd;font-size:12px;margin:8px 0 12px}#bistu-settings summary{cursor:pointer;padding:7px 0}#bistu-settings p{font-size:11px;line-height:1.7;margin:8px 0}.bistu-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.bistu-settings-grid label{display:flex;flex-direction:column;gap:5px}.bistu-settings-grid input,.bistu-settings-grid select{box-sizing:border-box;width:100%;min-width:0;background:#222;color:#fff;border:1px solid #555;padding:7px;border-radius:4px}#bistu-settings button,#bistu-show-keys,#bistu-check-keys{background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:5px;cursor:pointer}@media(max-width:480px){.bistu-settings-grid{grid-template-columns:1fr}}
-                @keyframes progress-stripes { from { background-position: 40px 0; } to { background-position: 0 0; } }
-                .bistu-fs-btn { background:rgba(255,255,255,0.2); border:none; color:white; padding:4px 10px; border-radius:12px; cursor:pointer; font-size:12px; transition:0.2s; outline:none; }
-                .bistu-fs-btn:hover { background:rgba(255,255,255,0.4); }
-            </style>
-        </div>
+            <footer class="bistu-footer"><div id="bistu-init-actions"><button type="button" id="bistu-start-btn" class="bistu-button">开始提取</button><button type="button" id="bistu-import-btn" class="bistu-button bistu-button-secondary">导入断点 ZIP</button><input type="file" id="bistu-file-input" hidden accept=".zip"></div><div id="bistu-run-actions" hidden><button type="button" id="bistu-pause-btn" class="bistu-button bistu-button-secondary">暂停并保存断点</button><button type="button" id="bistu-download-btn" class="bistu-button" disabled>等待生成 ZIP</button></div><button type="button" id="bistu-new-task" class="bistu-button bistu-button-quiet" hidden>开始新任务</button></footer>
+            <style>${extractorPanelStyles()}</style>
+        </section>
     `;
+
     document.body.insertAdjacentHTML('beforeend', panelHTML);
 
     const panel = document.getElementById(panelId);
@@ -268,20 +366,112 @@
     const pauseBtn = document.getElementById('bistu-pause-btn');
     const apiKeyInput = document.getElementById('bistu-apikey');
     const fullscreenBtn = document.getElementById('bistu-fullscreen-btn');
-    document.getElementById('bistu-show-keys').addEventListener('click', () => { apiKeyInput.style.webkitTextSecurity = apiKeyInput.style.webkitTextSecurity === 'none' ? 'disc' : 'none'; });
+    const panelTabs = ['overview', 'settings', 'logs'];
+    const panelTabScroll = new Map();
+    let selectedPanelTab = 'overview';
+    function selectPanelTab(name, focus = false) {
+        if (!panelTabs.includes(name)) return;
+        const workspace = document.getElementById('bistu-workspace');
+        panelTabScroll.set(selectedPanelTab, workspace.scrollTop);
+        selectedPanelTab = name;
+        for (const tab of panelTabs) {
+            const active = tab === name, button = document.getElementById('bistu-tab-' + tab);
+            button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1;
+            document.getElementById('bistu-panel-' + tab).hidden = !active;
+        }
+        workspace.scrollTop = panelTabScroll.get(name) || 0;
+        if (name !== 'settings') setKeyEditorOpen(false);
+        if (name === 'logs' && document.getElementById('bistu-log-follow').checked) logBox.scrollTop = logBox.scrollHeight;
+        if (focus) document.getElementById('bistu-tab-' + name).focus();
+    }
+    panelTabs.forEach((name, index) => {
+        const button = document.getElementById('bistu-tab-' + name);
+        button.addEventListener('click', () => selectPanelTab(name));
+        button.addEventListener('keydown', event => {
+            const next = event.key === 'Home' ? 0 : event.key === 'End' ? panelTabs.length - 1 : event.key === 'ArrowRight' ? (index + 1) % panelTabs.length : event.key === 'ArrowLeft' ? (index + panelTabs.length - 1) % panelTabs.length : -1;
+            if (next >= 0) { event.preventDefault(); selectPanelTab(panelTabs[next], true); }
+        });
+    });
+    document.getElementById('bistu-open-settings').addEventListener('click', () => selectPanelTab('settings', true));
+
+    const panelTheme = document.getElementById('bistu-theme');
+    try { const saved = localStorage.getItem('bistu-panel-theme'); if (['auto','light','dark'].includes(saved)) panelTheme.value = saved; } catch (_) {}
+    panel.dataset.theme = panelTheme.value;
+    panelTheme.addEventListener('change', () => {
+        panel.dataset.theme = panelTheme.value;
+        try { localStorage.setItem('bistu-panel-theme', panelTheme.value); } catch (_) {}
+    });
+
+    function redactPanelText(value) {
+        let text = String(value).replace(/sk-[a-zA-Z0-9_-]+/g, '[已隐藏 Key]');
+        for (const key of new Set([...keyManager.keys, ...parseApiKeys(apiKeyInput.value)])) if (key) text = text.split(key).join('[已隐藏 Key]');
+        return text;
+    }
+    function showPanelError(error) {
+        const feedback = document.getElementById('bistu-feedback');
+        feedback.textContent = redactPanelText(error?.message || error); feedback.hidden = false;
+        panel.querySelectorAll('[aria-invalid="true"]').forEach(input => input.removeAttribute('aria-invalid'));
+        if (error?.fieldId) {
+            const input = document.getElementById(error.fieldId);
+            if (input && panel.contains(input)) {
+                selectPanelTab('settings');
+                for (let parent = input.parentElement; parent && parent !== panel; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true;
+                input.setAttribute('aria-invalid', 'true'); input.focus();
+            }
+        }
+    }
+    panel.addEventListener('input', event => {
+        if (event.target.matches('#bistu-settings input, #bistu-settings select')) event.target.removeAttribute('aria-invalid');
+    });
+
+    let keyInputVisible = false;
+    const nativeKeyMask = typeof CSS !== 'undefined' && CSS.supports?.('-webkit-text-security', 'disc');
+    function renderKeyInputVisibility() {
+        apiKeyInput.style.webkitTextSecurity = keyInputVisible ? 'none' : 'disc';
+        apiKeyInput.hidden = !nativeKeyMask && !keyInputVisible;
+        const toggle = document.getElementById('bistu-show-keys');
+        toggle.textContent = keyInputVisible ? '隐藏 Key' : '显示 Key';
+        toggle.setAttribute('aria-pressed', String(keyInputVisible));
+    }
+    function refreshKeySummary() {
+        const count = parseApiKeys(apiKeyInput.value).length;
+        document.getElementById('bistu-key-count').textContent = count ? `已配置 ${count} 个不同 Key · 仅本页有效` : '尚未配置 Key · AI 可选';
+        document.getElementById('bistu-metric-keys').textContent = String(engineRunning ? keyManager.getCount() : count);
+        const edit = document.getElementById('bistu-edit-keys');
+        edit.textContent = document.getElementById('bistu-keys-editor').hidden ? (count ? '编辑 Key' : '配置 Key') : '收起并隐藏';
+    }
+    function setKeyEditorOpen(open) {
+        const editor = document.getElementById('bistu-keys-editor');
+        editor.hidden = !open;
+        document.getElementById('bistu-edit-keys').setAttribute('aria-expanded', String(open));
+        // The whole editor is hidden by default, including in browsers without
+        // text-security. Plain editing on those browsers requires this explicit action.
+        keyInputVisible = open && !nativeKeyMask;
+        renderKeyInputVisibility(); refreshKeySummary();
+        if (open) apiKeyInput.focus();
+    }
+    document.getElementById('bistu-edit-keys').addEventListener('click', () => setKeyEditorOpen(document.getElementById('bistu-keys-editor').hidden));
+    document.getElementById('bistu-show-keys').addEventListener('click', () => { keyInputVisible = !keyInputVisible; renderKeyInputVisibility(); });
+    apiKeyInput.addEventListener('input', refreshKeySummary);
+    apiKeyInput.addEventListener('keydown', event => { if (event.key === 'Escape' || event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); setKeyEditorOpen(false); document.getElementById('bistu-edit-keys').focus(); } });
+    renderKeyInputVisibility(); refreshKeySummary();
     document.getElementById('bistu-settings-reset').addEventListener('click', () => {
         for (const [key,[,value]] of Object.entries(SETTING_FIELDS)) document.getElementById('bistu-setting-' + key).value = value;
         for (const [key,[,value]] of Object.entries(SETTING_OPTIONS)) document.getElementById('bistu-setting-' + key).value = value;
         for (const [key,value] of Object.entries(MODEL_DEFAULTS)) document.getElementById('bistu-setting-' + key).value = value;
+        panel.querySelectorAll('[aria-invalid="true"]').forEach(input => input.removeAttribute('aria-invalid'));
+        clearPanelError(); refreshPanelControls();
+        addLog('运行设置已恢复默认；当前 Key 和题目进度保留。', 'info');
     });
+
     document.getElementById('bistu-check-keys').addEventListener('click', async () => {
-        if (engineRunning) return;
-        const button = document.getElementById('bistu-check-keys'), status = document.getElementById('bistu-key-status');
-        button.disabled = true; startBtn.disabled = true; importBtn.disabled = true;
+        if (engineRunning || panelOperation !== 'idle') return;
+        const status = document.getElementById('bistu-key-status');
+        panelOperation = 'checking'; clearPanelError(); refreshPanelControls();
         try {
             const settings = getSettings(); keyManager.updateKeys(apiKeyInput.value);
             const entries = [...keyManager.entries]; let index = 0, usable = 0, finished = 0;
-            if (!entries.length) { status.textContent = '请先输入 Key'; return; }
+            if (!entries.length) { const error = new Error('请先输入至少一个 Key，再进行检测。'); error.fieldId = 'bistu-apikey'; throw error; }
             await Promise.all(Array.from({length:Math.min(settings.aiConcurrency,entries.length)},async () => {
                 while (index < entries.length) {
                     const entry = entries[index++];
@@ -294,8 +484,8 @@
                     finished++; status.textContent = '不同 Key：' + entries.length + '，已检测 ' + finished + '，可用 ' + usable;
                 }
             }));
-        } catch (error) { status.textContent = error.message; }
-        finally { button.disabled = false; startBtn.disabled = false; importBtn.disabled = false; }
+        } catch (error) { status.textContent = '检测未完成，请查看提示。'; reportPanelError(error); }
+        finally { panelOperation = 'idle'; refreshPanelControls(); }
     });
 
     // ==========================================
@@ -303,160 +493,146 @@
     // ==========================================
 
     function updateTimerDisplay() {
-        let s = globalState.elapsedSeconds || 0;
-        let h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-        let pad = v => v.toString().padStart(2, '0');
-        let timeStr = h > 0 ? `${pad(h)}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
-        let timerEl = document.getElementById('bistu-global-timer');
-        if(timerEl) timerEl.innerText = `⏱️ ${timeStr}`;
+        const elapsed = globalState.elapsedSeconds || 0;
+        const pad = value => String(value).padStart(2, '0');
+        const value = [Math.floor(elapsed / 3600), Math.floor(elapsed / 60) % 60, elapsed % 60].map(pad);
+        document.getElementById('bistu-global-timer').textContent = (elapsed >= 3600 ? value : value.slice(1)).join(':');
     }
-
     setInterval(() => {
-        if (!globalState.isPaused && globalState.stage < 5 && !globalState.outOfKeys) {
-            globalState.elapsedSeconds++;
-            updateTimerDisplay();
-        }
+        if (engineRunning && !globalState.isPaused && globalState.stage < 5 && !globalState.outOfKeys) { globalState.elapsedSeconds++; updateTimerDisplay(); }
     }, 1000);
 
-    let isMaximized = false;
-    let preMaxStyles = {};
-    fullscreenBtn.addEventListener('click', () => {
-        if (!isMaximized) {
-            preMaxStyles = { left: panel.style.left, top: panel.style.top, right: panel.style.right, bottom: panel.style.bottom, width: panel.style.width, height: panel.style.height, borderRadius: panel.style.borderRadius };
-            panel.style.transition = 'all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)';
-            panel.style.left = '0px'; panel.style.top = '0px'; panel.style.width = window.innerWidth + 'px'; panel.style.height = window.innerHeight + 'px'; panel.style.borderRadius = '0px';
-            fullscreenBtn.innerText = '🗗 还原窗口'; isMaximized = true;
-            setTimeout(() => panel.style.transition = 'none', 300);
-        } else {
-            panel.style.transition = 'all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)';
-            panel.style.left = preMaxStyles.left; panel.style.top = preMaxStyles.top; panel.style.width = preMaxStyles.width; panel.style.height = preMaxStyles.height; panel.style.borderRadius = preMaxStyles.borderRadius;
-            fullscreenBtn.innerText = '🔲 铺满窗口'; isMaximized = false;
-            setTimeout(() => panel.style.transition = 'none', 300);
-        }
-    });
-
-    window.addEventListener('resize', () => {
-        if (isMaximized) { panel.style.width = window.innerWidth + 'px'; panel.style.height = window.innerHeight + 'px'; }
-    });
-
-    let isDragging = false, offsetX, offsetY;
-    header.addEventListener('mousedown', (e) => {
-        if (isMaximized || e.target.closest('#bistu-fullscreen-btn')) return;
-        isDragging = true; const rect = panel.getBoundingClientRect(); offsetX = e.clientX - rect.left; offsetY = e.clientY - rect.top;
-        panel.style.transition = 'none'; panel.style.right = 'auto'; panel.style.bottom = 'auto';
-    });
-    document.addEventListener('mousemove', (e) => {
-        if (!isDragging) return;
-        let left = e.clientX - offsetX; let top = e.clientY - offsetY;
-        left = Math.max(0, Math.min(left, window.innerWidth - panel.offsetWidth)); top = Math.max(0, Math.min(top, window.innerHeight - panel.offsetHeight));
-        panel.style.left = left + 'px'; panel.style.top = top + 'px';
-    });
-    document.addEventListener('mouseup', () => { isDragging = false; });
-
-    const resizers = document.querySelectorAll('.panel-resizer');
-    let currentResizer = null;
-    let original_width = 0, original_height = 0, original_x = 0, original_y = 0, original_mouse_x = 0, original_mouse_y = 0;
-
-    resizers.forEach(resizer => {
-        resizer.addEventListener('mousedown', function(e) {
-            if (isMaximized) return;
-            e.preventDefault();
-            const rect = panel.getBoundingClientRect();
-            original_width = rect.width; original_height = rect.height; original_x = rect.left; original_y = rect.top;
-            original_mouse_x = e.clientX; original_mouse_y = e.clientY;
-            currentResizer = resizer;
-            panel.style.right = 'auto'; panel.style.bottom = 'auto'; panel.style.left = original_x + 'px'; panel.style.top = original_y + 'px';
-            window.addEventListener('mousemove', resizePanel); window.addEventListener('mouseup', stopResizePanel);
-        });
-    });
-
-    function resizePanel(e) {
-        if (!currentResizer) return;
-        const dir = currentResizer.className.split(' ')[1];
-        const dx = e.clientX - original_mouse_x; const dy = e.clientY - original_mouse_y;
-        let newW = original_width, newH = original_height, newL = original_x, newT = original_y;
-        if (dir.includes('e')) newW = original_width + dx;
-        if (dir.includes('s')) newH = original_height + dy;
-        if (dir.includes('w')) { newW = original_width - dx; newL = original_x + dx; }
-        if (dir.includes('n')) { newH = original_height - dy; newT = original_y + dy; }
-        if (newW >= 400) { panel.style.width = newW + 'px'; if(dir.includes('w')) panel.style.left = newL + 'px'; }
-        if (newH >= 500) { panel.style.height = newH + 'px'; if(dir.includes('n')) panel.style.top = newT + 'px'; }
+    let isMaximized = false, restoredPanelRect = null, panelDrag = null;
+    function boundedPanelRect(rect, fullscreen = false) {
+        const gap = fullscreen ? 0 : 8, maxWidth = Math.max(1, window.innerWidth - gap * 2), maxHeight = Math.max(1, window.innerHeight - gap * 2);
+        const width = fullscreen ? maxWidth : Math.max(Math.min(360,maxWidth), Math.min(rect.width,maxWidth));
+        const height = fullscreen ? maxHeight : Math.max(Math.min(440,maxHeight), Math.min(rect.height,maxHeight));
+        return {width,height,left:fullscreen ? 0 : Math.max(gap,Math.min(rect.left,window.innerWidth-width-gap)),top:fullscreen ? 0 : Math.max(gap,Math.min(rect.top,window.innerHeight-height-gap))};
     }
-    function stopResizePanel() { currentResizer = null; window.removeEventListener('mousemove', resizePanel); window.removeEventListener('mouseup', stopResizePanel); }
+    function placePanel(rect) {
+        panel.style.right = 'auto'; panel.style.bottom = 'auto';
+        for (const key of ['left','top','width','height']) panel.style[key] = Math.round(rect[key]) + 'px';
+    }
+    fullscreenBtn.addEventListener('click', () => {
+        if (!isMaximized) restoredPanelRect = panel.getBoundingClientRect().toJSON();
+        isMaximized = !isMaximized; panel.dataset.maximized = String(isMaximized);
+        placePanel(boundedPanelRect(restoredPanelRect || panel.getBoundingClientRect(), isMaximized));
+        fullscreenBtn.textContent = isMaximized ? '还原窗口' : '铺满窗口'; fullscreenBtn.setAttribute('aria-pressed', String(isMaximized));
+    });
+    window.addEventListener('resize', () => { panelDrag = null; placePanel(boundedPanelRect(panel.getBoundingClientRect(), isMaximized)); });
+    function beginPanelDrag(event, direction = '') {
+        if (isMaximized || event.button !== 0 || !direction && event.target.closest('button,input,select,textarea,a')) return;
+        const rect = panel.getBoundingClientRect();
+        panelDrag = {direction,x:event.clientX,y:event.clientY,rect:{left:rect.left,top:rect.top,width:rect.width,height:rect.height},pointerId:event.pointerId};
+        if (event.currentTarget.setPointerCapture && event.pointerId !== undefined) event.currentTarget.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    }
+    const pointerEvents = 'PointerEvent' in window;
+    header.addEventListener(pointerEvents ? 'pointerdown' : 'mousedown', event => beginPanelDrag(event));
+    panel.querySelectorAll('.panel-resizer').forEach(handle => {
+        const direction = [...handle.classList].find(value => /^(n|s|e|w|ne|nw|se|sw)$/.test(value));
+        handle.addEventListener(pointerEvents ? 'pointerdown' : 'mousedown', event => beginPanelDrag(event,direction));
+    });
+    document.addEventListener(pointerEvents ? 'pointermove' : 'mousemove', event => {
+        if (!panelDrag || pointerEvents && panelDrag.pointerId !== event.pointerId) return;
+        const {rect,direction,x,y} = panelDrag, dx = event.clientX-x, dy = event.clientY-y;
+        if (!direction) { placePanel(boundedPanelRect({...rect,left:rect.left+dx,top:rect.top+dy})); return; }
+        const minWidth = Math.min(360,window.innerWidth-16), minHeight = Math.min(440,window.innerHeight-16);
+        let left=rect.left,top=rect.top,right=rect.left+rect.width,bottom=rect.top+rect.height;
+        if (direction.includes('w')) left=Math.max(8,Math.min(rect.left+dx,right-minWidth));
+        if (direction.includes('e')) right=Math.min(window.innerWidth-8,Math.max(right+dx,left+minWidth));
+        if (direction.includes('n')) top=Math.max(8,Math.min(rect.top+dy,bottom-minHeight));
+        if (direction.includes('s')) bottom=Math.min(window.innerHeight-8,Math.max(bottom+dy,top+minHeight));
+        placePanel(boundedPanelRect({left,top,width:right-left,height:bottom-top}));
+    });
+    document.addEventListener(pointerEvents ? 'pointerup' : 'mouseup', () => { panelDrag = null; });
+    if (pointerEvents) document.addEventListener('pointercancel', () => { panelDrag = null; });
+    placePanel(boundedPanelRect(panel.getBoundingClientRect()));
 
-    let logQueue = [];
-    let isFlushingLog = false;
-    function addLog(msg, type = "info") {
-        msg = String(msg).replace(/sk-[a-zA-Z0-9_-]+/g, "[已隐藏 Key]");
-        for (const key of keyManager.keys) if (key) msg = msg.split(key).join("[已隐藏 Key]");
-        logQueue.push({msg, type});
-        if (!isFlushingLog) {
-            isFlushingLog = true;
-            requestAnimationFrame(flushLogs);
-        }
+    let logQueue = [], isFlushingLog = false;
+    function addLog(msg, type = 'info') {
+        logQueue.push({msg:redactPanelText(msg),type});
+        if (!isFlushingLog) { isFlushingLog = true; requestAnimationFrame(flushLogs); }
+    }
+    function logVisible(level) {
+        const filter = document.getElementById('bistu-log-filter').value;
+        return filter === 'all' || filter === 'warning' && ['warning','error'].includes(level) || filter === 'error' && level === 'error';
     }
     function flushLogs() {
+        const follow = document.getElementById('bistu-log-follow');
+        const atBottom = logBox.scrollHeight - logBox.clientHeight - logBox.scrollTop <= 48;
         const fragment = document.createDocumentFragment();
-        // ✅ 修复：放宽阈值至 150，解决快速刷新导致吸附判定丢失的问题
-        const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 150;
-
-        while(logQueue.length > 0) {
-            const {msg, type} = logQueue.shift();
-            const p = document.createElement('div');
-            p.style.fontSize = "12px"; p.style.marginBottom = "4px"; p.style.lineHeight = "1.4"; p.style.wordBreak = "break-all"; p.style.whiteSpace = "pre-wrap";
-            p.style.fontFamily = "Consolas, monospace";
-            let color = "#bbb";
-            if(type === "error") color = "#ff5252";
-            else if(type === "success") color = "#69f0ae";
-            else if(type === "warning") color = "#ffb74d";
-            else if(type === "scan") color = "#4fc3f7";
-            else if(type === "ai") color = "#ce93d8";
-            else if(type === "image") color = "#ffd54f";
-
-            p.style.color = color;
-            let timeStr = new Date().toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
-            p.innerText = `[${timeStr}] ${msg}`;
-            fragment.appendChild(p);
+        for (const {msg,type} of logQueue.splice(0)) {
+            const row = document.createElement('div'); row.className = 'bistu-log-entry'; row.dataset.level = type;
+            row.textContent = '[' + new Date().toLocaleTimeString('zh-CN',{hour12:false}) + '] ' + msg;
+            row.hidden = !logVisible(type); fragment.appendChild(row);
         }
         logBox.appendChild(fragment);
-        const logLimit = Number(document.getElementById("bistu-setting-logLimit")?.value) || 1000;
-        while (logBox.childElementCount > Math.max(100, Math.min(logLimit, 10000))) logBox.firstElementChild.remove();
-        // ✅ 修复：使用瞬间跳底 behavior: 'auto'，彻底解决平滑动画追不上的 BUG
-        if (isScrolledToBottom) logBox.scrollTo({ top: logBox.scrollHeight, behavior: 'auto' });
+        const limit = Math.max(100,Math.min(Number(document.getElementById('bistu-setting-logLimit').value) || 1000,10000));
+        while (logBox.childElementCount > limit) logBox.firstElementChild.remove();
+        if (follow.checked && (atBottom || selectedPanelTab !== 'logs')) logBox.scrollTop = logBox.scrollHeight;
         isFlushingLog = false;
     }
+    document.getElementById('bistu-log-filter').addEventListener('change', () => {
+        for (const row of logBox.children) row.hidden = !logVisible(row.dataset.level || 'info');
+        if (document.getElementById('bistu-log-follow').checked) logBox.scrollTop = logBox.scrollHeight;
+    });
+    const logFollow = document.getElementById('bistu-log-follow');
+    logFollow.addEventListener('change', () => { if (logFollow.checked) logBox.scrollTop = logBox.scrollHeight; });
+    logBox.addEventListener('scroll', () => { if (selectedPanelTab === 'logs' && logBox.scrollHeight-logBox.clientHeight-logBox.scrollTop > 48) logFollow.checked = false; },{passive:true});
+    document.getElementById('bistu-log-clear').addEventListener('click', () => { logQueue = []; logBox.replaceChildren(); });
+    document.getElementById('bistu-log-copy').addEventListener('click', async event => {
+        const button=event.currentTarget; button.disabled=true;
+        const text=[...logBox.children].filter(row=>!row.hidden).map(row=>row.textContent).join('\n');
+        try {
+            if (navigator.clipboard?.writeText && window.isSecureContext) await navigator.clipboard.writeText(text);
+            else {
+                const input=document.createElement('textarea'); input.value=text; input.style.cssText='position:fixed;left:-9999px'; panel.appendChild(input); input.select();
+                try { if (!document.execCommand('copy')) throw new Error('浏览器未允许复制日志，可选中日志手动复制。'); } finally { input.remove(); button.focus(); }
+            }
+            button.textContent='已复制';
+        } catch (error) { showPanelError(error); button.textContent='复制失败'; }
+        finally { setTimeout(()=>{button.textContent='复制';button.disabled=false;},1200); }
+    });
 
-    function updateUI(step, text, isDone = false) {
-        let el = document.getElementById(`bistu-val-${step}`);
-        if(el) el.innerText = text;
-        if(isDone) {
-            let st = document.getElementById(`bistu-step-${step}`);
-            st.style.color = '#81c784'; st.innerHTML = st.innerHTML.replace('⏳', '✅').replace('▶️', '✅');
-        } else {
-            let st = document.getElementById(`bistu-step-${step}`);
-            st.style.color = '#ddd'; st.innerHTML = st.innerHTML.replace('✅', '▶️').replace('⏳', '▶️');
-        }
-        updateGlobalProgress();
+    function setStageState(step, state) {
+        const row=document.getElementById('bistu-step-'+step), icon=document.getElementById('bistu-stage-icon-'+step);
+        row.dataset.state=state; icon.textContent=state==='done'?'✓':String(step);
     }
-
+    function updateUI(step, text, isDone = false) {
+        document.getElementById('bistu-val-'+step).textContent=text;
+        setStageState(step,isDone?'done':'active'); updateGlobalProgress();
+    }
     function updateGlobalProgress() {
-        let percent = 0; let status = "处理中";
-        if (globalState.stage === 1) { percent = (globalState.listProgress.typeIndex / (globalState.scope?.typeDefinitions?.length || PLATFORM_CONFIG.TYPES.length)) * 5; status = "📡 扫描题库中..."; }
-        else if (globalState.stage === 2) { let done = allData.filter(i => i.s2_done).length; percent = 5 + (allData.length > 0 ? (done / allData.length) * 45 : 0); status = "📚 提取题目并验证答案..."; }
-        else if (globalState.stage === 3) { let aiItems = allData.filter(i => i.NeedsAI || (globalState.settings?.answerReviewMode === 'double-check' && i.QuestionType !== 'Program')); let done = aiItems.filter(i => i.s3_done).length; percent = 50 + (aiItems.length > 0 ? (done / aiItems.length) * 40 : 40); status = "🧠 AI 解答与答案复核中..."; }
-        else if (globalState.stage === 4) { let imgItems = Array.from(imageQueue.values()); let done = imgItems.filter(i => i.downloaded || i.failed || i.sourceUnavailable).length; percent = 90 + (imgItems.length > 0 ? (done / imgItems.length) * 10 : 10); status = "🖼️ 并发下载图片中..."; }
-        else if (globalState.stage >= 5) {
-            percent = 100;
-            const warnings = allData.filter(item => item.ExtractionWarning).length;
-            status = `✅ 已提取 ${allData.length} 题${warnings ? `（${warnings} 题含平台内容提示）` : ''}`;
+        const settings=globalState.settings || {};
+        let details=0,aiTotal=0,aiDone=0,warnings=0,savedImages=0,processedImages=0;
+        for (const item of allData) {
+            if (item.s2_done) details++; if (item.ExtractionWarning) warnings++;
+            if (item.NeedsAI || settings.answerReviewMode==='double-check' && item.QuestionType!=='Program') { aiTotal++; if(item.s3_done) aiDone++; }
         }
-
-        if (globalState.isPaused) status = globalState.stage > 4 ? "⚠️ ZIP 尚未生成，请重试打包" : "⏸️ 任务已暂停 (支持续传)";
-        if (globalState.outOfKeys) status = "🛑 API Key耗尽，已挂起！";
-
-        document.getElementById('bistu-global-percent').innerText = `${percent.toFixed(1)}%`;
-        document.getElementById('bistu-global-progress').style.width = `${percent}%`;
-        document.getElementById('bistu-global-status').innerText = status;
+        for (const image of imageQueue.values()) { if(image.buffer) savedImages++; if(image.downloaded||image.failed||image.sourceUnavailable) processedImages++; }
+        const homework=globalState.homeworkProgress;
+        const includeHomework=(document.getElementById('bistu-setting-includeHomework')?.value ?? settings.includeHomework ?? 'enabled') === 'enabled';
+        const checkingHomework=globalState.stage===3 && includeHomework && !homework?.done;
+        let percent=0,status='准备就绪';
+        if(globalState.stage===1) {percent=((globalState.listProgress?.typeIndex||0)/(globalState.scope?.typeDefinitions?.length||PLATFORM_CONFIG.TYPES.length))*5;status='扫描题库中…';}
+        else if(globalState.stage===2) {percent=5+(allData.length?details/allData.length*43:0);status='提取题目与平台答案…';}
+        else if(checkingHomework) {percent=48+(homework?.jobs.length?homework.cursor/homework.jobs.length*2:0);status='核对学期作业，关联重复题…';}
+        else if(globalState.stage===3) {percent=50+(aiTotal?aiDone/aiTotal*40:40);status='AI 解答与答案复核中…';}
+        else if(globalState.stage===4) {percent=90+(imageQueue.size?processedImages/imageQueue.size*10:10);status='保存原图中…';}
+        else if(globalState.stage>=5) {percent=100;status=`已提取 ${allData.length} 题${warnings?`（${warnings} 题含平台内容提示）`:''}`;}
+        if(globalState.isPaused) status=globalState.stage>4?'ZIP 尚未生成，可重试打包':'任务已暂停，可继续提取';
+        if(globalState.outOfKeys) status='暂无可用 Key，可补充或留空跳过 AI';
+        document.getElementById('bistu-global-status').textContent=status;
+        document.getElementById('bistu-global-percent').textContent=percent.toFixed(1)+'%';
+        const progress=document.getElementById('bistu-global-progress'); progress.style.width=percent+'%';progress.parentElement.setAttribute('aria-valuenow',percent.toFixed(1));
+        document.getElementById('bistu-metric-questions').textContent=String(allData.length);
+        document.getElementById('bistu-metric-images').textContent=String(savedImages);
+        document.getElementById('bistu-metric-ai').textContent=String(aiDone);
+        refreshKeySummary();
+        document.getElementById('bistu-homework-status').textContent=!includeHomework?'本次仅采集练习题，作业检查已关闭。':homework?`学期作业：已核对 ${homework.cursor || 0} / ${homework.jobs.length} 份，关联重复题 ${homework.duplicates || 0} 道，补入 ${homework.added || 0} 道${homework.skipped?.length?`，${homework.skipped.length} 份未纳入（见日志与报告）`:''}。`:'练习优先；随后核对学期作业，重复题关联来源，独有题单独标记。';
+        if(checkingHomework) {setStageState(2,'active');setStageState(3,'waiting');}
+        if(typeof refreshPanelControls==='function') refreshPanelControls();
     }
 
     const yieldThread = () => new Promise(r => setTimeout(r, 0));
@@ -850,35 +1026,124 @@
     // ==========================================
 
 
-    startBtn.addEventListener('click', async () => {
-        if (engineRunning || startBtn.disabled) return;
-        startBtn.disabled = true; pauseBtn.disabled = true;
-        initActions.style.display = 'none'; apiKeyContainer.style.display = 'none'; runActions.style.display = 'flex';
-        globalState.isPaused = false;
+    function hasPanelTask() {
+        return taskHasStarted || allData.length > 0 || imageQueue.size > 0 || globalState.stage > 1 || globalState.listProgress.typeIndex > 0 || globalState.listProgress.pageIndex > 1;
+    }
+    function refreshPanelControls() {
+        const root = document.getElementById('bistu-extractor-panel');
+        if (!root) return;
+        const wasBusy = root.getAttribute('aria-busy') === 'true';
+        const busy = engineRunning || panelOperation !== 'idle', hasTask = hasPanelTask();
+        const complete = globalState.stage > 4 && !globalState.isPaused && latestPackage?.current && latestPackage.isFinal;
+        const state = panelOperation === 'checking' ? 'checking' : ['preparing','importing'].includes(panelOperation) ? 'preparing' :
+            panelOperation === 'packaging' ? 'packaging' : engineRunning ? (globalState.isPaused ? 'stopping' : 'running') :
+            panelError ? 'error' : complete ? 'complete' : hasTask ? 'paused' : 'ready';
+        root.dataset.state = state; root.setAttribute('aria-busy',String(busy));
+        setSettingsDisabled(busy);
+        const element = id => document.getElementById(id);
+        const set = (id, disabled, text, hidden = false) => { const node = element(id); if (!node) return; node.disabled = disabled; node.hidden = hidden; if (text !== null) node.textContent = text; };
+        const noKeys = typeof parseApiKeys === 'function' && !parseApiKeys(element('bistu-apikey')?.value || '').length;
+        set('bistu-start-btn',busy,'开始提取',hasTask);
+        set('bistu-import-btn',busy,'导入断点 ZIP');
+        set('bistu-new-task',busy,'开始新任务',!hasTask);
+        set('bistu-check-keys',busy,panelOperation === 'checking' ? '正在检测…' : '检测 Key（不生成答案）');
+        const input = element('bistu-apikey'); if (input) input.disabled = busy;
+        const pauseText = state === 'stopping' ? '正在安全停止…' : state === 'packaging' ? '正在生成 ZIP…' : state === 'running' ? '暂停并保存断点' :
+            globalState.stage > 4 ? '重试生成 ZIP' : globalState.outOfKeys && noKeys ? '跳过 AI 并继续' : '恢复提取进度';
+        set('bistu-pause-btn',busy && state !== 'running',pauseText,!hasTask || !!complete);
+        const readyPackage = !!latestPackage?.current;
+        set('bistu-download-btn',busy || !readyPackage,readyPackage ? latestPackage.saveRequested ? '再次保存 ZIP' : latestPackage.isFinal ? '保存完整 ZIP' : '保存断点 ZIP' : state === 'packaging' ? '正在生成 ZIP…' : '等待生成 ZIP',!hasTask);
+        for (const id of ['bistu-init-actions','bistu-run-actions','bistu-apikey-container']) {
+            const node = element(id); if (!node) continue;
+            node.style.removeProperty('display'); node.hidden = id === 'bistu-run-actions' && !hasTask;
+        }
+        // Validation can fail while the settings are locked; focus after unlocking.
+        if (wasBusy && !busy && panelError?.fieldId && typeof showPanelError === 'function') showPanelError(panelError);
+        const status = element('bistu-global-status');
+        const messages = {ready:'准备就绪',preparing:panelOperation === 'importing' ? '正在读取并校验断点…' : '正在准备提取…',checking:'正在检测 Key，不生成答案…',stopping:'等待在途请求结束，然后保存断点…',packaging:'正在生成 ZIP，请稍候…',paused:globalState.outOfKeys ? 'Key 不可用：可更换 Key，或清空后跳过 AI 继续' : '任务已暂停，可以保存 ZIP 或继续',error:'操作未完成，请查看错误提示并重试'};
+        if (status && messages[state]) status.textContent = messages[state];
+        if (state === 'ready') {
+            const percent = element('bistu-global-percent'), progress = element('bistu-global-progress');
+            if (percent) percent.textContent = '0.0%';
+            if (progress) { progress.style.width = '0%'; progress.parentElement.setAttribute('aria-valuenow','0'); }
+        }
+    }
+    function reportPanelError(error) {
+        panelError = error;
+        if (typeof showPanelError === 'function') showPanelError(error);
+        else addLog(error?.message || String(error),'error');
+        refreshPanelControls();
+    }
+    function clearPanelError() {
+        panelError = null;
+        const feedback = document.getElementById('bistu-feedback');
+        if (feedback) { feedback.hidden = true; feedback.textContent = ''; }
+    }
+    function capturePanelTask() {
+        return {state:{...globalState,listProgress:{...globalState.listProgress}},allData,imageQueue,imgCounter,
+            currentLang,currentDegree,currentChapter,currentKno,currentSearch,origin,latestPackage,taskHasStarted};
+    }
+    function restorePanelTask(previous) {
+        globalState = previous.state; allData = previous.allData; imageQueue = previous.imageQueue; imgCounter = previous.imgCounter;
+        currentLang = previous.currentLang; currentDegree = previous.currentDegree; currentChapter = previous.currentChapter;
+        currentKno = previous.currentKno; currentSearch = previous.currentSearch; origin = previous.origin;
+        latestPackage = previous.latestPackage; taskHasStarted = previous.taskHasStarted;
+    }
+    async function startFreshTask() {
+        if (engineRunning || panelOperation !== 'idle') return;
+        const previous = capturePanelTask(); let handedToEngine = false;
+        panelOperation = 'preparing'; clearPanelError(); refreshPanelControls();
         try {
+            getSettings();
+            if (hasPanelTask() && !(latestPackage?.current && latestPackage.saveRequested) &&
+                !window.confirm('当前进度尚未触发 ZIP 保存。开始新任务会清空当前内存进度；建议取消并先保存断点。仍要开始新任务吗？')) return;
+            globalState = {version:SCRIPT_VERSION,stage:1,isPaused:false,outOfKeys:false,elapsedSeconds:0,listProgress:{typeIndex:0,pageIndex:1,totalPages:0}};
+            allData = []; imageQueue = new Map(); imgCounter = 1; latestPackage = null; taskHasStarted = false;
             initializePlatformVariables();
-            addLog("加载 ZIP 引擎...", "info");
-            await ensureDependencies();
-            pauseBtn.disabled = false;
-            await runEngine();
+            addLog('加载 ZIP 引擎…','info'); await ensureDependencies();
+            taskHasStarted = true;
+            for (let step = 1; step <= 4; step++) {
+                const value = document.getElementById('bistu-val-' + step); if (value) value.textContent = '等待';
+                if (typeof setStageState === 'function') setStageState(step,'waiting');
+            }
+            updateTimerDisplay();
+            if (typeof setKeyEditorOpen === 'function') setKeyEditorOpen(false);
+            if (typeof selectPanelTab === 'function') selectPanelTab('overview');
+            handedToEngine = true; await runEngine('preparing');
         } catch (error) {
-            globalState.isPaused = true;
-            addLog(`启动失败：${error.message}`, 'error');
-            initActions.style.display = 'flex'; apiKeyContainer.style.display = 'block'; runActions.style.display = 'none';
-        } finally { startBtn.disabled = false; pauseBtn.disabled = false; }
+            if (!handedToEngine) restorePanelTask(previous);
+            globalState.isPaused = true; reportPanelError(error);
+        } finally {
+            if (panelOperation === 'preparing') panelOperation = 'idle';
+            refreshPanelControls();
+        }
+    }
+    startBtn.addEventListener('click',startFreshTask);
+    document.getElementById('bistu-new-task')?.addEventListener('click',() => {
+        if (engineRunning || panelOperation !== 'idle') return;
+        if (hasPanelTask() && !(latestPackage?.current && latestPackage.saveRequested) && !window.confirm('当前进度尚未触发 ZIP 保存。新任务会清空内存进度；仍要继续吗？')) return;
+        globalState = {version:SCRIPT_VERSION,stage:1,isPaused:true,outOfKeys:false,elapsedSeconds:0,listProgress:{typeIndex:0,pageIndex:1,totalPages:0}};
+        allData = []; imageQueue = new Map(); imgCounter = 1; latestPackage = null; taskHasStarted = false; clearPanelError();
+        for (let step = 1; step <= 4; step++) {
+            const value = document.getElementById('bistu-val-' + step); if (value) value.textContent = '等待';
+            if (typeof setStageState === 'function') setStageState(step,'waiting');
+        }
+        updateTimerDisplay(); updateGlobalProgress();
+        if (typeof selectPanelTab === 'function') selectPanelTab('overview');
+        refreshPanelControls();
     });
-
-    importBtn.addEventListener('click', () => { fileInput.click(); });
+    apiKeyInput.addEventListener('input',refreshPanelControls);
+    importBtn.addEventListener('click', () => { if (!engineRunning && panelOperation === 'idle') fileInput.click(); });
 
     fileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0]; if (!file) return;
-        if (engineRunning || startBtn.disabled || importBtn.disabled) { e.target.value = ""; return; }
-        const previous = { settings:null, state: {...globalState, listProgress: {...globalState.listProgress}}, allData, imageQueue, imgCounter,
-            currentLang, currentDegree, currentChapter, currentKno, currentSearch, origin };
-        startBtn.disabled = true; importBtn.disabled = true; pauseBtn.disabled = true;
+        if (engineRunning || panelOperation !== 'idle') { e.target.value = ""; return; }
+        if (hasPanelTask() && !(latestPackage?.current && latestPackage.saveRequested) && !window.confirm('导入将替换尚未触发 ZIP 保存的当前进度。仍要继续导入吗？')) { e.target.value = ''; return; }
+        const previous = { ...capturePanelTask(), settings:null }; let handedToEngine = false;
+        panelOperation = 'importing'; clearPanelError(); refreshPanelControls();
         try {
             previous.settings = getSettings();
-            initializePlatformVariables(); initActions.style.display = 'none'; apiKeyContainer.style.display = 'none'; runActions.style.display = 'flex';
+            initializePlatformVariables();
             addLog(`📂 正在解包断点记忆文件 [${file.name}]...`, "warning");
             await ensureDependencies();
             let loadedZip = await JSZip.loadAsync(file); let stateFile = loadedZip.file("state.json");
@@ -909,6 +1174,7 @@
             globalState.elapsedSeconds = Number.isFinite(globalState.elapsedSeconds) ? globalState.elapsedSeconds : 0;
             allData = stateObj.allData; imgCounter = stateObj.imgCounter;
             imageQueue = restoredImages;
+            latestPackage = null; taskHasStarted = true;
             for (const data of imageQueue.values()) imgCounter = Math.max(imgCounter, Number(data.filename.match(/^img_(\d+)/i)[1]) + 1);
             allData.forEach(item => {
                 if (item.CollectionSource !== 'homework' && ['Single', 'Multiple', 'TrueOrFalse'].includes(item.QuestionType) && item.s2_done) {
@@ -957,50 +1223,59 @@
             addLog(`✅ 成功找回系统记忆！当前位于阶段：${globalState.stage}`, "success");
             addLog(`📊 统计数据：总题目 ${allData.length} | 已提取 ${allData.filter(i=>i.s2_done).length} | AI 已解答 ${allData.filter(i=>i.s3_done).length} | 图片记录 ${imageQueue.size}`, "scan");
 
-            updateUI(1, `已恢复: ${allData.length} 题`, globalState.stage > 1);
-            updateUI(2, `已恢复提取: ${allData.filter(i=>i.s2_done).length} 题`, globalState.stage > 2);
-            updateUI(3, `已恢复解答: ${allData.filter(i=>i.s3_done).length} 题`, globalState.stage > 3);
+            // A prior task may have completed every row. Rebuild all four rows
+            // together so a later restored stage cannot retain its old checkmark.
+            const restoredLabels = [
+                `已恢复: ${allData.length} 题`,
+                `已恢复提取: ${allData.filter(item => item.s2_done).length} 题`,
+                `已恢复解答: ${allData.filter(item => item.s3_done).length} 题`,
+                `已恢复原图: ${Array.from(imageQueue.values()).filter(image => image.buffer).length} / ${imageQueue.size} 张`
+            ];
+            restoredLabels.forEach((label, index) => {
+                const step = index + 1;
+                document.getElementById('bistu-val-' + step).textContent = label;
+                setStageState(step, globalState.stage > step ? 'done' : globalState.stage === step ? 'active' : 'waiting');
+            });
+            updateGlobalProgress();
 
-            pauseBtn.disabled = false;
-            await runEngine();
+            if (typeof setKeyEditorOpen === 'function') setKeyEditorOpen(false);
+            if (typeof selectPanelTab === 'function') selectPanelTab('overview');
+            handedToEngine = true; await runEngine('importing');
         } catch (err) {
-            if (previous.settings) applySettingsToUi(previous.settings);
-            globalState = previous.state; allData = previous.allData; imageQueue = previous.imageQueue; imgCounter = previous.imgCounter;
-            currentLang = previous.currentLang; currentDegree = previous.currentDegree; currentChapter = previous.currentChapter;
-            currentKno = previous.currentKno; currentSearch = previous.currentSearch; origin = previous.origin;
-            addLog(`❌ 解析 ZIP 异常: ${err.message}`, "error"); initActions.style.display = 'flex'; apiKeyContainer.style.display = 'block'; runActions.style.display = 'none';
+            if (!handedToEngine) {
+                if (previous.settings) applySettingsToUi(previous.settings);
+                restorePanelTask(previous);
+            }
+            globalState.isPaused = true;
+            addLog(`❌ 解析 ZIP 异常: ${err.message}`, 'error'); reportPanelError(err);
         } finally {
-            startBtn.disabled = false; importBtn.disabled = false; pauseBtn.disabled = false;
+            if (panelOperation === 'importing') panelOperation = 'idle';
             e.target.value = "";
+            if (typeof refreshKeySummary === 'function') refreshKeySummary();
+            refreshPanelControls();
         }
     });
-
-    function setPauseUI() {
-        const button = document.getElementById('bistu-pause-btn');
-        button.innerText = globalState.stage > 4 ? "▶️ 重试生成 ZIP" : "▶️ 恢复提取进度"; button.style.background = "#4db6ac";
-        button.disabled = engineRunning; apiKeyContainer.style.display = 'block';
-    }
 
     pauseBtn.addEventListener('click', () => {
         if (engineRunning) {
             if (!globalState.isPaused) {
-                globalState.isPaused = true; pauseBtn.disabled = true;
-                pauseBtn.innerText = "⚠️ 正在安全停止..."; pauseBtn.style.background = "#555";
+                globalState.isPaused = true;
                 addLog("正在等待已发出的请求结束，然后保存断点。", "warning");
+                refreshPanelControls();
             }
             return;
         }
-        if (!globalState.isPaused) return;
-        try { persistRunSettings(); } catch (error) { addLog(error.message, "error"); return; }
-        const wasOutOfKeys = globalState.outOfKeys;
+        if (panelOperation !== 'idle' || !globalState.isPaused) return;
+        try { persistRunSettings(); } catch (error) { reportPanelError(error); return; }
         keyManager.updateKeys(apiKeyInput.value.trim());
-        if (wasOutOfKeys && !keyManager.getCount()) { globalState.outOfKeys = true; addLog("请填入可用的 API Key 后恢复。", 'warning'); return; }
+        if (!keyManager.getCount()) addLog('未提供 Key，将保留现有答案并跳过尚未完成的 AI 解答或复核。','warning');
+        clearPanelError();
         globalState.isPaused = false; globalState.lastError = null;
-        pauseBtn.innerText = "⏸️ 暂停并生成防丢 ZIP"; pauseBtn.style.background = "#ef5350"; apiKeyContainer.style.display = 'none';
-        const downloadButton = document.getElementById('bistu-download-btn');
-        downloadButton.disabled = true; downloadButton.innerText = "🚧 处理中..."; downloadButton.style.background = "#444";
+        if (typeof setKeyEditorOpen === 'function') setKeyEditorOpen(false);
+        if (typeof selectPanelTab === 'function') selectPanelTab('overview');
         runEngine();
     });
+    refreshPanelControls();
 
     // ==========================================
     // 5. 核心流程状态机 (支持断点)
@@ -2342,7 +2617,11 @@
     }
 
     async function buildZipAndDownload(isFinal = false) {
+        if (!['idle','running'].includes(panelOperation)) throw new Error('当前正在处理其他操作，请等待完成后再生成 ZIP。');
         if (isFinal && homeworkEnabled() && !globalState.homeworkProgress?.done) throw new Error('作业检查尚未完成，不能生成已完成包。');
+        const previousOperation = panelOperation;
+        panelOperation = 'packaging'; refreshPanelControls();
+        try {
         addLog(isFinal ? "⚙️ 全流程结束，正在封装最终离线网页和二进制图片..." : "⚙️ 正在生成【安全状态快照断点包】...", "warning");
         let zipArch = new JSZip(); let iFolder = zipArch.folder("images");
         for (let imgData of imageQueue.values()) { if (imgData.filename && imgData.buffer) iFolder.file(imgData.filename, imgData.buffer); }
@@ -2358,20 +2637,24 @@
         zipArch.file("index.html", html);
         let finalZipBlob = await zipArch.generateAsync({type:"blob"});
 
-        setPauseUI();
-        let pBtn = document.getElementById('bistu-pause-btn'); if (isFinal) pBtn.style.display = "none";
-
-        let currentDownloadBtn = document.getElementById('bistu-download-btn'); let newDownloadBtn = currentDownloadBtn.cloneNode(true); currentDownloadBtn.replaceWith(newDownloadBtn);
-        newDownloadBtn.innerText = "💾 点击保存提取产物 (ZIP)"; newDownloadBtn.style.background = "#087f68"; newDownloadBtn.style.color = "white"; newDownloadBtn.style.cursor = "pointer"; newDownloadBtn.disabled = false;
-
-        newDownloadBtn.addEventListener('click', () => {
-            let a = document.createElement("a"); a.href = URL.createObjectURL(finalZipBlob); let timeStr = getFormattedTime();
-            a.download = isFinal ? `[已完成]Java离线题库_${timeStr}.zip` : `[未完成_断点${allData.length}题]Java离线题库_${timeStr}.zip`;
-            a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 30000); addLog(`🎊 下载指令已触发！文件名: ${a.download}`, "success");
-            if (!isFinal) { newDownloadBtn.disabled = true; newDownloadBtn.innerText = "🚧 待续传..."; newDownloadBtn.style.background = "#444"; newDownloadBtn.style.cursor = "not-allowed"; }
-            else { newDownloadBtn.innerText = "✅ 继续下载产物"; addLog("✨ 所有工作已圆满完成！面板将永久驻留，随时可点击上方按钮再次下载。", "info"); }
-        });
-        addLog("🔔 ZIP 文件数据块流生成完毕，请点击上方的绿色按钮保存到本地！", "success");
+        latestPackage = {blob:finalZipBlob,isFinal,current:true,saveRequested:false,
+            filename:isFinal ? `[已完成]Java离线题库_${getFormattedTime()}.zip` : `[未完成_断点${allData.length}题]Java离线题库_${getFormattedTime()}.zip`};
+        taskHasStarted = true;
+        document.getElementById('bistu-download-btn').onclick = () => {
+            if (engineRunning || panelOperation !== 'idle' || !latestPackage?.current) return;
+            try {
+                const saved = latestPackage, link = document.createElement('a');
+                link.href = URL.createObjectURL(saved.blob); link.download = saved.filename;
+                link.click(); setTimeout(() => URL.revokeObjectURL(link.href),30000);
+                saved.saveRequested = true;
+                addLog(`ZIP 保存请求已发出：${saved.filename}。请确认浏览器下载完成；需要时可再次保存。`,'success');
+            } catch (error) { reportPanelError(error); }
+            refreshPanelControls();
+        };
+        addLog('ZIP 已生成，请点击“保存 ZIP”下载到本地。','success');
+        } finally {
+            panelOperation = previousOperation; refreshPanelControls();
+        }
     }
 
     function offlineQuestionClassification(item) {
@@ -3025,14 +3308,17 @@ offlineViewerRuntime();</script></body></html>`;
         `;
     }
 
-    async function runEngine() {
-        if (engineRunning) return;
-        // Settings may enable homework checking while paused in the image/ZIP stage.
-        if (homeworkEnabled() && !globalState.homeworkProgress?.done && globalState.stage >= 3) globalState.stage = 3;
-        if (globalState.stage >= 3 && keyManager.keys.length && allData.some(item => needsAiWork(item))) globalState.stage = 3;
-        engineRunning = true; setSettingsDisabled(true);
-        updateGlobalProgress();
+    async function runEngine(fromOperation = null) {
+        if (engineRunning || panelOperation !== 'idle' && panelOperation !== fromOperation) return;
+        engineRunning = true; panelOperation = 'running'; taskHasStarted = true;
+        clearPanelError(); if (latestPackage) latestPackage.current = false;
+        refreshPanelControls();
         try {
+            persistRunSettings();
+            // Settings may enable homework or AI checking while paused in the image/ZIP stage.
+            if (homeworkEnabled() && !globalState.homeworkProgress?.done && globalState.stage >= 3) globalState.stage = 3;
+            if (globalState.stage >= 3 && keyManager.keys.length && allData.some(item => needsAiWork(item))) globalState.stage = 3;
+            updateGlobalProgress();
             while (globalState.stage <= 4 && !globalState.isPaused) {
                 if (globalState.stage === 1) await runStage1();
                 else if (globalState.stage === 2) await runStage2();
@@ -3047,18 +3333,21 @@ offlineViewerRuntime();</script></body></html>`;
             globalState.isPaused = true; globalState.lastError = error.message;
             addLog(`提取已暂停，未标记完成：${error.message}`, 'error');
         }
-        pauseBtn.disabled = true;
+        if (globalState.isPaused && globalState.lastError && globalState.lastError !== 'PAUSED') {
+            reportPanelError(new Error(globalState.lastError === 'ALL_KEYS_EXHAUSTED' ? '所有 Key 均不可用。可更换 Key，或清空 Key 后跳过未完成的 AI 任务继续导出。' : globalState.lastError));
+        }
         try {
             await buildZipAndDownload(!globalState.isPaused && globalState.stage > 4);
         } catch (error) {
             globalState.isPaused = true;
-            addLog(`ZIP 打包失败，数据仍保留在当前页面：${error.message}`, 'error');
+            addLog(`ZIP 打包失败，数据仍保留在当前页面：${error.message}`, 'error'); reportPanelError(error);
         } finally {
             if (ocrWorker?.terminate) { try { await ocrWorker.terminate(); } catch (_) {} }
             ocrWorker = null; ocrWorkerPromise = null;
-            engineRunning = false; setSettingsDisabled(false); pauseBtn.disabled = false;
-            if (globalState.isPaused) setPauseUI();
+            engineRunning = false; panelOperation = 'idle';
+            if (typeof refreshKeySummary === 'function') refreshKeySummary();
             updateGlobalProgress();
+            refreshPanelControls();
         }
     }
 

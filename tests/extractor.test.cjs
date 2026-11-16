@@ -348,10 +348,12 @@ test('legacy scanning snapshot without scope is rejected before any API request'
 test('blocked ZIP dependency returns to start controls with a useful error', () => withPage(async page => {
   await page.evaluate(() => { window.JSZip = undefined; });
   await page.locator('#bistu-start-btn').click();
-  await page.waitForFunction(() => document.getElementById('bistu-extractor-panel-log').textContent.includes('启动失败'));
+  await page.waitForFunction(() => /JSZip/.test(document.getElementById('bistu-feedback').textContent) && !document.getElementById('bistu-start-btn').disabled);
+  assert.equal(await page.locator('#bistu-feedback').isVisible(), true);
   assert.equal(await page.locator('#bistu-init-actions').isVisible(), true);
   assert.equal(await page.locator('#bistu-start-btn').isEnabled(), true);
   assert.equal(await page.evaluate(() => __test.state.isPaused), true);
+  assert.equal(await page.evaluate(() => __ajaxCalls.length), 0);
 }));
 
 test('a previously failed image is downloaded again on resume', () => withPage(async page => {

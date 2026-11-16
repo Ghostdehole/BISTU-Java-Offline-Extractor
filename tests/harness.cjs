@@ -15,6 +15,9 @@ function instrument(source) {
       runStage1, runStage2, runStage3, runStage4, runEngine,
       buildZipAndDownload, generateOfflineHtml, initializePlatformVariables,
       runWithConcurrency, keyManager,
+      addLog: typeof addLog === 'function' ? addLog : undefined,
+      flushLogs: typeof flushLogs === 'function' ? flushLogs : undefined,
+      refreshPanelControls: typeof refreshPanelControls === 'function' ? refreshPanelControls : undefined,
       getSettings: typeof getSettings === 'function' ? getSettings : undefined,
       reconcilePlatformAnswer: typeof reconcilePlatformAnswer === 'function' ? reconcilePlatformAnswer : undefined,
       requestDeepSeek: typeof requestDeepSeek === 'function' ? requestDeepSeek : undefined,
@@ -62,6 +65,10 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
     return route.abort('blockedbyclient');
   });
   const page = await context.newPage();
+  // Existing state-machine fixtures deliberately replace synthetic in-memory
+  // tasks. Accept that explicit replacement, including the panel's loss guard.
+  // Tests of cancellation can remove this listener and supply their own choice.
+  page.on('dialog', dialog => dialog.type() === 'confirm' ? dialog.accept() : dialog.dismiss());
   await page.goto('http://fixture.test/Manage/Practice/index');
   await page.addScriptTag({ path: jszipPath });
   await page.evaluate(() => {
@@ -120,6 +127,10 @@ async function createHarness(browser, sourceOverride, fixtureHtml, contextOption
     __test.initializePlatformVariables();
     __test.state.isPaused = false;
   });
+  // Reader fixtures replace the document with page.setContent, which preserves
+  // this window's callbacks unlike opening the exported file in a new document.
+  // Let extraction-panel initialization finish before that synthetic transition.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   return { page, close: () => context.close() };
 }
 
