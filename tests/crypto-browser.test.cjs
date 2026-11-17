@@ -106,7 +106,7 @@ test('snapshot export-password preflight rolls back before any request, while pu
       const zip=new JSZip();zip.file('state.json',JSON.stringify(snapshot));
       await h.page.locator('#bistu-file-input').setInputFiles({name:'synthetic-preflight.zip',mimeType:'application/zip',buffer:await zip.generateAsync({type:'nodebuffer'})});
     };
-    for (const [password,confirmation,notice] of [['short','short','12–256'],['Synthetic valid export password','','不一致']]) {
+    for (const [password,confirmation,notice] of [['abc','abc','4–256'],['Synthetic valid export password','','不一致']]) {
       await h.page.evaluate(([password,confirmation])=>{
         document.getElementById('bistu-export-password').value=password;
         document.getElementById('bistu-export-password-confirm').value=confirmation;

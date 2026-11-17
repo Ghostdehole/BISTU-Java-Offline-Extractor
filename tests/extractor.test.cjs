@@ -431,7 +431,7 @@ test('OCR login HTML skips AI without storing an image, then stage 4 pauses for 
     await __test.runStage4();
     return { calls, afterAI, paused: __test.state.isPaused, stage: __test.state.stage, buffer: __test.images.get(url).buffer, answered: __test.data[0].s3_done, needsAI: __test.data[0].NeedsAI };
   });
-  assert.deepEqual(result.calls, Array(4).fill('http://fixture.test/picture.png'));
+  assert.deepEqual(result.calls, Array(7).fill('http://fixture.test/picture.png'));
   assert.equal(result.afterAI.paused, false);
   assert.equal(result.afterAI.stage, 4);
   assert.match(result.afterAI.warning, /AI 解答尚未生成/);
@@ -792,7 +792,7 @@ test('nonempty corrupt image responses pause download instead of reporting compl
     const image = __test.images.values().next().value;
     return { attempts, stage: __test.state.stage, paused: __test.state.isPaused, downloaded: image.downloaded, failed: image.failed, buffer: image.buffer };
   });
-  assert.equal(result.attempts, 3);
+  assert.equal(result.attempts, 6);
   assert.equal(result.stage, 4);
   assert.equal(result.paused, true);
   assert.equal(result.downloaded, false);
@@ -854,8 +854,8 @@ test('confirmed 404 and 410 images retain source metadata while later downloads 
   });
   assert.equal(result.stage, 5);
   assert.equal(result.paused, false);
-  assert.equal(result.attempts['http://fixture.test/missing.png'], 3);
-  assert.equal(result.attempts['http://fixture.test/gone.png'], 3);
+  assert.equal(result.attempts['http://fixture.test/missing.png'], 6);
+  assert.equal(result.attempts['http://fixture.test/gone.png'], 6);
   assert.equal(result.report.complete, true);
   assert.equal(result.report.imagesComplete, false);
   assert.equal(result.report.images.expected, 3);
@@ -1983,8 +1983,8 @@ test('narrow-screen prompt and answer images retain natural proportions despite 
 test('AI settings expose every default in the UI and read valid user changes', () => withPage(async page => {
   const defaults = {
     listConcurrency: 6, detailConcurrency: 6, aiConcurrency: 6, imageConcurrency: 6,
-    pageSize: 10, platformTimeoutMs: 30000, platformAttempts: 3, platformDelayMs: 100,
-    imageAttempts: 3, imageRetryDelayMs: 500, perKeyConcurrency: 2, aiAttempts: 3,
+    pageSize: 10, platformTimeoutMs: 30000, platformAttempts: 6, platformDelayMs: 100,
+    imageAttempts: 6, imageRetryDelayMs: 500, perKeyConcurrency: 2, aiAttempts: 5, aiFormatAttempts: 3,
     aiTimeoutMs: 180000, aiRetryDelayMs: 1000, model: 'deepseek-flash', programModel: 'deepseek-v4-pro',
     visionModel: 'deepseek-flash', thinking: 'enabled', reasoningEffort: 'high', maxTokens: 32768,
     temperature: 0.2, imageMode: 'vision', ocrClean: false
@@ -2240,7 +2240,7 @@ test('AI refuses truncated, filtered, tool, refusal, blank and malformed respons
         PlatformDetailChecked: true, s2_done: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
       __fetch = async () => response ? Response.json(response) : new Response('synthetic invalid JSON', { headers: { 'Content-Type': 'application/json' } });
       await __test.runStage3();
-      results.push({ name, completed: __test.data[0].s3_done, answer: __test.data[0].SniffedAnswer, paused: __test.state.isPaused, stage: __test.state.stage });
+      results.push({ name, completed: __test.data[0].s3_done, answer: __test.data[0].SniffedAnswer, paused: __test.state.isPaused, stage: __test.state.stage, error:__test.data[0].AIError });
     }
     __test.state.isPaused = false;
     __fetch = async () => __aiResponse('Recovered on the same key');
@@ -2250,8 +2250,9 @@ test('AI refuses truncated, filtered, tool, refusal, blank and malformed respons
   for (const attempt of result.results) {
     assert.notEqual(attempt.completed, true, attempt.name);
     assert.ok(!attempt.answer, attempt.name);
-    assert.equal(attempt.paused, true, attempt.name);
-    assert.equal(attempt.stage, 3, attempt.name);
+    assert.equal(attempt.paused, false, attempt.name);
+    assert.equal(attempt.stage, 4, attempt.name);
+    assert.ok(attempt.error, attempt.name);
   }
   assert.equal(result.recovered.SniffedAnswer, 'Recovered on the same key');
   assert.equal(result.recovered.s3_done, true);
@@ -2276,7 +2277,7 @@ test('AI rate limiting cools down the pool without declaring keys exhausted', ()
   assert.equal(result.row.SniffedAnswer, 'Rate recovered');
 }));
 
-test('AI network failure releases the per-key lease so a paused task can resume', () => withPage(async page => {
+test('AI network failure is isolated and releases the per-key lease for retry', () => withPage(async page => {
   const result = await page.evaluate(async () => {
     __setSettings({ aiConcurrency: 1, perKeyConcurrency: 1, aiAttempts: 1, aiRetryDelayMs: 0 });
     __test.keyManager.updateKeys('synthetic-network-key'); __test.state.stage = 3;
@@ -2284,12 +2285,13 @@ test('AI network failure releases the per-key lease so a paused task can resume'
       PlatformDetailChecked: true, s2_done: true, s3_done: false, NeedsAI: true, imgUrls: [] }]);
     __fetch = async () => { throw new TypeError('Synthetic transport failure'); };
     await __test.runStage3();
-    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done };
+    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done, error:__test.data[0].AIError };
     __test.state.isPaused = false; __fetch = async () => __aiResponse('Network recovered');
     await Promise.race([__test.runStage3(), new Promise((_, reject) => setTimeout(() => reject(new Error('Network failure leaked a lease')), 2000))]);
     return { failed, row: __test.data[0], paused: __test.state.isPaused };
   });
-  assert.equal(result.failed.paused, true);
+  assert.equal(result.failed.paused, false);
+  assert.equal(result.failed.error.category, 'request');
   assert.notEqual(result.failed.done, true);
   assert.equal(result.row.SniffedAnswer, 'Network recovered');
   assert.equal(result.paused, false);
@@ -2381,12 +2383,13 @@ test('an AI timeout aborts the request and frees its only lease for resume', () 
     let aborted = false;
     __fetch = (_, options) => new Promise((resolve, reject) => options.signal.addEventListener('abort', () => { aborted = true; reject(new DOMException('Synthetic timeout', 'AbortError')); }));
     await __test.runStage3();
-    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done };
+    const failed = { paused: __test.state.isPaused, done: __test.data[0].s3_done, error:__test.data[0].AIError };
     __test.state.isPaused = false; __fetch = async () => __aiResponse('After timeout');
     await Promise.race([__test.runStage3(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout leaked its lease')), 2000))]);
     return { aborted, failed, row: __test.data[0] };
   });
-  assert.equal(result.aborted, true); assert.equal(result.failed.paused, true);
+  assert.equal(result.aborted, true); assert.equal(result.failed.paused, false);
+  assert.equal(result.failed.error.category, 'request');
   assert.notEqual(result.failed.done, true); assert.equal(result.row.SniffedAnswer, 'After timeout');
 }));
 

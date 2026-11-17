@@ -59,7 +59,8 @@ function fixture() {
       DetailHtml: '<p>Synthetic homework alternatives</p><div class="div_TopicOptions"><p class="p_TopicOption">A、Homework alpha</p><p class="p_TopicOption">B、Homework beta</p></div>',
       SniffedAnswer: 'B、Homework beta', AnswerSource: 'platform-answer' }),
     base('Single', 13, { reviewStatus: 'uncertain', reviewIssue: { category: 'multiple_correct', explanation: 'Two original choices can hold under the stated condition.' } }),
-    base('Program', 14, { DetailHtml: '<p>Synthetic second program editor for shared draft vocabulary.</p>', SniffedAnswer: 'class AnotherReference {}', AnswerSource: 'platform-reference' })
+    base('Program', 14, { DetailHtml: '<p>Synthetic second program editor for shared draft vocabulary.</p>', SniffedAnswer: 'class AnotherReference {}', AnswerSource: 'platform-reference' }),
+    base('Single', 15, { AIReview: {version:1,status:'different',fingerprint:'synthetic-stale-fingerprint',independentAnswer:'LEGACY_READER_ANSWER',comparison:{reason:'LEGACY_READER_REASON'}} })
   ];
 }
 
@@ -82,7 +83,7 @@ before(async () => {
           version: 2, status, fingerprint: __test.aiReviewFingerprint(row),
           policy: { javaTarget: __test.getSettings().javaTarget, preview: false }, options: __test.aiOptionCatalog(row),
           independentAnswer: 'Synthetic independent alternative <script>window.__practiceExecuted=true</script>', promptText: 'Synthetic blind prompt',
-          independentAssessment: { optionIds: ids, issues, explanation: 'Synthetic reasoning', javaVersions: [] },
+          independentAssessment: { optionIds: ids, issues, explanation: 'Synthetic reasoning', javaVersions: row.reviewIssue ? ['Java 8 / Java 25'] : [] },
           comparison: { verdict: status, reason: 'Synthetic comparison', optionIds: ids, issues,
             platformAssessment: status === 'consistent' ? 'supported' : 'uncertain', aiAssessment: status === 'consistent' ? 'supported' : 'uncertain', javaVersions: [] }
         };
@@ -275,6 +276,99 @@ test('practice: drafts survive search, combined filters and same-document naviga
   await row.locator('.practice-toggle').click(); await row.locator('.practice-toggle').click();
   assert.equal(await row.locator('.practice-code').inputValue(), draft);
 }, { blockedStorage: true }));
+
+test('answer layout: platform answers stay prominent while current and historical AI details remain collapsed, searchable and keyboard-accessible', () => withReader(async page => {
+  for (const index of [8,9,10,13,15]) {
+    const row=card(page,index), details=row.locator('.ai-review-detail');
+    assert.equal(await row.locator('.answer-main>.answer-content').isVisible(),true);
+    assert.equal(await row.locator('.answer-main>.answer-content').textContent(),'B. Beta & literal');
+    assert.equal(await details.getAttribute('open'),null);
+    assert.equal(await details.locator('summary').isVisible(),true);
+    assert.equal(await details.locator('.answer-content').isVisible(),false);
+    await details.locator('summary').focus(); await page.keyboard.press('Enter');
+    assert.equal(await details.evaluate(node=>node.open),true);
+    assert.equal(await details.locator('.answer-content').isVisible(),true);
+    assert.match(await details.textContent(),index===15?/LEGACY_READER_ANSWER[\s\S]*LEGACY_READER_REASON/:/Synthetic independent alternative[\s\S]*Synthetic reasoning[\s\S]*Synthetic comparison/);
+    if(index===13) {
+      assert.match(await details.locator('summary').textContent(),/1 项提示/);
+      assert.match(await details.locator('.ai-review-issues').textContent(),/Two original choices/);
+      assert.match(await details.locator('.ai-review-versions').textContent(),/Java 8 \/ Java 25/);
+    }
+    if(index===15) assert.match(await details.locator('summary').textContent(),/历史复核待更新/);
+    await page.keyboard.press('Space'); assert.equal(await details.evaluate(node=>node.open),false);
+  }
+  const aiOnly=card(page,7);
+  assert.equal(await aiOnly.locator('.answer-main>.answer-content').isVisible(),true,'the only available AI reference must not be collapsed');
+  assert.match(await aiOnly.locator('.answer-main>.answer-content').textContent(),/AI says option B/);
+  assert.equal(await page.locator('.ai-review script,.ai-review img').count(),0);
+  await page.locator('#keywordFilter').fill('LEGACY_READER_ANSWER');
+  await page.waitForFunction(()=>document.querySelector('#visibleCount').textContent==='1');
+  const legacy=card(page,15);
+  assert.equal(await legacy.isVisible(),true); assert.equal(await legacy.locator('.ai-review-detail').getAttribute('open'),null);
+  await legacy.locator('.answer-toggle').click();
+  assert.equal(await legacy.locator('.answer-box').isVisible(),false);
+  assert.equal(await legacy.locator('.practice-area').isVisible(),true);
+  await legacy.locator('.answer-toggle').click();
+  assert.equal(await legacy.locator('.practice-area').isVisible(),false);
+  assert.equal(await legacy.locator('.ai-review-detail').getAttribute('open'),null);
+}));
+
+for(const engine of ['chromium','webkit']) test(engine+': answer layout keeps the heading and both actions aligned in light and dark narrow layouts',()=>withReader(async page=>{
+  for(const width of [1280,390,320]) {
+    await page.setViewportSize({width,height:844});
+    for(const theme of ['light','dark']) {
+      await page.locator('#themeToggle').selectOption(theme);
+      for(const index of [4,8,10,13,15]) {
+        const row=card(page,index); await row.scrollIntoViewIfNeeded();
+        const geometry=await row.evaluate(node=>{
+          const bounds=node.getBoundingClientRect(), heading=node.querySelector('.answer-caption').getBoundingClientRect();
+          const buttons=[...node.querySelectorAll('.answer-controls>button')].map(button=>{const r=button.getBoundingClientRect();return {left:r.left,right:r.right,cy:r.top+r.height/2,height:r.height};});
+          const summary=node.querySelector('.ai-review-detail>summary')?.getBoundingClientRect();
+          return {width:node.clientWidth,scroll:node.scrollWidth,left:bounds.left,right:bounds.right,headingRight:heading.right,headingCy:heading.top+heading.height/2,buttons,summary:summary?{left:summary.left,right:summary.right}:null};
+        });
+        assert.ok(geometry.scroll<=geometry.width+1,JSON.stringify({width,theme,index,geometry}));
+        assert.equal(geometry.buttons.length,2);
+        assert.ok(geometry.headingRight<=geometry.buttons[0].left&&geometry.buttons[0].right<=geometry.buttons[1].left);
+        for(const button of geometry.buttons) assert.ok(Math.abs(button.cy-geometry.headingCy)<=2&&button.right<=geometry.right&&button.height>=36);
+        if(geometry.summary) assert.ok(geometry.summary.left>=geometry.left&&geometry.summary.right<=geometry.right);
+      }
+    }
+  }
+},{engine}));
+
+for(const engine of ['chromium','webkit']) test(engine+': answer layout print temporarily expands visible review details and restores them after printing, cancellation or failure',()=>withReader(async page=>{
+  await card(page,9).locator('.ai-review-detail>summary').click();
+  await card(page,10).locator('.answer-toggle').click();
+  await page.locator('#chapterFilter').selectOption('Synthetic even');
+  const flags=()=>page.evaluate(()=>[8,9,10,15].map(index=>document.querySelectorAll('.topic')[index].querySelector('.ai-review-detail').open));
+  assert.deepEqual(await flags(),[false,true,false,false]);
+  await page.evaluate(()=>dispatchEvent(new Event('beforeprint')));
+  assert.deepEqual(await flags(),[true,true,false,false],'hidden answers and filtered questions cannot be expanded for print');
+  assert.equal(await card(page,10).locator('.answer-box').isVisible(),false);
+  await page.evaluate(()=>dispatchEvent(new Event('afterprint')));
+  assert.deepEqual(await flags(),[false,true,false,false],'native print cancellation also restores the exact previous state');
+  await page.evaluate(()=>{
+    window.__reviewDecodeStates=[];window.__reviewPrintCalls=0;
+    const nativeDecode=HTMLImageElement.prototype.decode;
+    HTMLImageElement.prototype.decode=function(){__reviewDecodeStates.push(document.querySelectorAll('.topic')[8].querySelector('.ai-review-detail').open);return nativeDecode.call(this);};
+    window.print=()=>{__reviewPrintCalls++;window.__reviewAtPrint=[8,9,10,15].map(index=>document.querySelectorAll('.topic')[index].querySelector('.ai-review-detail').open);dispatchEvent(new Event('afterprint'));};
+  });
+  await page.locator('#printBtn').click();
+  await page.waitForFunction(()=>__reviewPrintCalls===1&&!document.querySelector('#printBtn').disabled);
+  assert.deepEqual(await page.evaluate(()=>__reviewAtPrint),[true,true,false,false]);
+  const decoding=await page.evaluate(()=>__reviewDecodeStates);
+  assert.ok(decoding.length>0&&decoding.every(Boolean),'review expansion must precede image decode preparation');
+  assert.deepEqual(await flags(),[false,true,false,false]);
+  await page.evaluate(()=>{window.print=()=>{throw Error('Synthetic print dialog failure');};});
+  await page.locator('#printBtn').click();await page.locator('#printStatus').waitFor({state:'visible'});
+  assert.deepEqual(await flags(),[false,true,false,false]);
+  await page.emulateMedia({media:'print'});
+  await page.waitForFunction(()=>document.querySelectorAll('.topic')[8].querySelector('.ai-review-detail').open);
+  assert.deepEqual(await flags(),[true,true,false,false]);
+  await page.emulateMedia({media:'screen'});
+  await page.waitForFunction(()=>!document.querySelectorAll('.topic')[8].querySelector('.ai-review-detail').open);
+  assert.deepEqual(await flags(),[false,true,false,false]);
+},{engine}));
 
 test('practice completion: local draft symbols and keywords replace only the caret prefix through keyboard acceptance', () => withReader(async page => {
   const first = await openPractice(page, 4), other = await openPractice(page, 14);

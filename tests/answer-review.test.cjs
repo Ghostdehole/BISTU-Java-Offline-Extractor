@@ -10,7 +10,7 @@ async function withReview(fn) {
   const harness=await createHarness(browser);
   try {
     await harness.page.evaluate(()=>{
-      __setSettings({answerReviewMode:'double-check',aiConcurrency:1,perKeyConcurrency:1,aiAttempts:1,aiRetryDelayMs:0});
+      __setSettings({answerReviewMode:'double-check',aiConcurrency:1,perKeyConcurrency:1,aiAttempts:1,aiFormatAttempts:1,aiRetryDelayMs:0});
       __test.keyManager.updateKeys('synthetic-review-key');__test.state.stage=3;
       window.__independent=(answer,type='Single',extra={})=>JSON.stringify({answer,optionIds:['Single','Multiple','TrueOrFalse'].includes(type)?['option_1']:[],issues:[],explanation:'Synthetic independent reasoning',javaVersions:[],...extra});
       window.__comparison=(verdict,reason,type='Single',extra={})=>JSON.stringify({verdict,reason,optionIds:['Single','Multiple','TrueOrFalse'].includes(type)?['option_1']:[],issues:[],platformAssessment:'supported',aiAssessment:'supported',javaVersions:[],...extra});
@@ -86,7 +86,7 @@ test('answer review: missing answers generate once, old AI needs a v2 assessment
   assert.equal(result.rows[3].SniffedAnswer,'class GeneratedProgram {}');assert.ok(!result.rows[3].AIReview);
 }));
 
-test('answer review: invalid comparison JSON pauses without discarding generation and resume pays only for comparison',()=>withReview(async page=>{
+test('answer review: invalid comparison JSON leaves one item pending and resume pays only for comparison',()=>withReview(async page=>{
   const invalid=['not JSON','```json\n{"verdict":"consistent","reason":"x"}\n```','{"verdict":"unknown","reason":"x"}','{"verdict":"consistent","reason":""}','{"verdict":"consistent","reason":"x","extra":true}'];
   const result=await page.evaluate(async({invalid,row})=>{
     const results=[];
@@ -95,7 +95,7 @@ test('answer review: invalid comparison JSON pauses without discarding generatio
       let calls=0;const bodies=[];
       __fetch=async(_,options)=>{calls++;bodies.push(JSON.parse(options.body));return __aiResponse(calls===1?__independent('Retain this independent answer'):response);};
       await __test.runStage3();
-      const interrupted={paused:__test.state.isPaused,done:__test.data[0].s3_done,review:structuredClone(__test.data[0].AIReview),platform:__test.data[0].SniffedAnswer};
+      const interrupted={paused:__test.state.isPaused,done:__test.data[0].s3_done,review:structuredClone(__test.data[0].AIReview),error:__test.data[0].AIError,platform:__test.data[0].SniffedAnswer};
       __test.state.isPaused=false;
       __fetch=async(_,options)=>{calls++;bodies.push(JSON.parse(options.body));return __aiResponse(__comparison('consistent','Successful retry'));};
       await __test.runStage3();
@@ -104,10 +104,10 @@ test('answer review: invalid comparison JSON pauses without discarding generatio
     return results;
   },{invalid,row:question()});
   for(const [index,resultRow] of result.entries()) {
-    assert.equal(resultRow.interrupted.paused,true,'invalid case '+index);assert.equal(resultRow.interrupted.done,false);
+    assert.equal(resultRow.interrupted.paused,false,'invalid case '+index);assert.equal(resultRow.interrupted.done,false);assert.equal(resultRow.interrupted.error.phase,'comparison');assert.equal(resultRow.interrupted.error.category,'format');
     assert.equal(resultRow.interrupted.review.status,'generated');assert.equal(resultRow.interrupted.review.independentAnswer,'Retain this independent answer');
     assert.equal(resultRow.interrupted.platform,'<p>PLATFORM_ONLY_SENTINEL</p>');assert.equal(resultRow.calls,3);assert.equal(resultRow.stage,4);
-    assert.equal(resultRow.row.AIReview.status,'consistent');assert.match(JSON.stringify(resultRow.bodies[2].messages),/Retain this independent answer/);
+    assert.equal(resultRow.row.AIReview.status,'consistent');assert.equal(resultRow.row.AIError,undefined);assert.match(JSON.stringify(resultRow.bodies[2].messages),/Retain this independent answer/);
   }
 }));
 
@@ -135,7 +135,7 @@ test('answer review: absent keys and truncated generation never mark a platform 
     await __test.runStage3();return {withoutKeys,calls,row:__test.data[0],paused:__test.state.isPaused};
   },question());
   assert.equal(result.withoutKeys.calls,0);assert.equal(result.withoutKeys.row.s3_done,false);assert.ok(!result.withoutKeys.row.AIReview);
-  assert.equal(result.calls,1);assert.equal(result.paused,true);assert.equal(result.row.s3_done,false);assert.ok(!result.row.AIReview);
+  assert.equal(result.calls,1);assert.equal(result.paused,false);assert.equal(result.row.s3_done,false);assert.ok(!result.row.AIReview);assert.equal(result.row.AIError.phase,'independent');
   assert.equal(result.row.SniffedAnswer,'<p>PLATFORM_ONLY_SENTINEL</p>');
 }));
 
@@ -252,7 +252,7 @@ test('answer review v2: invalid generation schemas and unknown option references
     return out;
   },question());
   for(const [index,entry] of result.entries()){
-    assert.equal(entry.paused,true,'invalid generation '+index);assert.equal(entry.row.s3_done,false);assert.ok(!entry.row.AIReview);
+    assert.equal(entry.paused,false,'invalid generation '+index);assert.equal(entry.row.s3_done,false);assert.ok(!entry.row.AIReview);assert.equal(entry.row.AIError.category,'format');
     assert.equal(entry.row.SniffedAnswer,'<p>PLATFORM_ONLY_SENTINEL</p>');
   }
 }));
@@ -265,7 +265,7 @@ test('answer review v2: invalid comparison option IDs retain a valid generated a
     __test.state.isPaused=false;__fetch=async()=>{calls++;return __aiResponse(__comparison('different','Use original option identifiers','Single',{optionIds:['option_2'],platformAssessment:'unsupported'}));};
     await __test.runStage3();return {paused,calls,row:__test.data[0]};
   },question());
-  assert.equal(result.paused.paused,true);assert.equal(result.paused.review.version,2);assert.equal(result.paused.review.status,'generated');
+  assert.equal(result.paused.paused,false);assert.equal(result.paused.review.version,2);assert.equal(result.paused.review.status,'generated');
   assert.equal(result.calls,3);assert.equal(result.row.AIReview.status,'different');assert.equal(result.row.AIReview.independentAnswer,'Keep independent assessment');
 }));
 
@@ -412,4 +412,114 @@ test('answer review v2: repeated image positions and swapped image-only options 
       for(const prompt of material) {assert.deepEqual(prompt.ocrImageIds,['image_1','image_2']);assert.equal(prompt.ocrOriginal.length,2);assert.deepEqual(prompt.imageIds,[]);}
     }
   }
+}));
+
+test('answer review recovery: format retries provide feedback without relaxing independent-choice validation',()=>withReview(async page=>{
+  const result=await page.evaluate(async row=>{
+    __setSettings({aiFormatAttempts:3});__test.setData([row]);const bodies=[];
+    const answers=['{"answer":"missing required fields"}',
+      __independent('Contradictory original choice','Single',{issues:[{category:'no_valid_option',explanation:'No option applies'}]}),
+      __independent('A corrected independent answer'),'invalid comparison JSON',__comparison('consistent','Valid comparison after retry')];
+    __fetch=async(_,options)=>{bodies.push(JSON.parse(options.body));return __aiResponse(answers[bodies.length-1]);};
+    await __test.runStage3();return {row:__test.data[0],bodies,stage:__test.state.stage,paused:__test.state.isPaused};
+  },question());
+  assert.equal(result.bodies.length,5);assert.equal(result.stage,4);assert.equal(result.paused,false);
+  assert.equal(result.row.AIReview.independentAnswer,'A corrected independent answer');assert.equal(result.row.AIReview.status,'consistent');assert.equal(result.row.AIError,undefined);
+  for(const index of [1,2,4]) assert.match(result.bodies[index].messages[0].content,/Previous output failed validation/);
+  for(const index of [0,1,2]) assert.doesNotMatch(JSON.stringify(result.bodies[index]),/PLATFORM_ONLY_SENTINEL/);
+  assert.match(result.bodies[2].messages[0].content,/无有效选项/);
+}));
+
+test('answer review recovery: exhausted comparison retries isolate one item, process later items, and resume comparison only',()=>withReview(async page=>{
+  const result=await page.evaluate(async base=>{
+    __setSettings({aiFormatAttempts:3});
+    const rows=['Bad comparison','Good comparison'].map((title,index)=>({...structuredClone(base),GlobalUID:index,TopicGuid:'recovery-'+index,Title:title,
+      DetailHtml:base.DetailHtml.replace('Independent synthetic question',title),ExtractionWarning:index?'':'Existing platform warning'}));
+    __test.setData(rows);const calls=[];
+    __fetch=async(_,options)=>{
+      const body=JSON.parse(options.body),prompt=JSON.parse(body.messages[1].content),compare=Object.hasOwn(prompt,'platformAnswer');
+      calls.push({question:prompt.question,compare});
+      return __aiResponse(compare&&prompt.question.includes('Bad comparison')?'{}':compare?__comparison('consistent','Other item succeeds'):__independent('Saved independent '+(prompt.question.includes('Bad')?'bad':'good')));
+    };
+    await __test.runStage3();const pending={rows:structuredClone(rows),stage:__test.state.stage,paused:__test.state.isPaused,calls:calls.length};
+    __test.state.stage=3;
+    __fetch=async(_,options)=>{const prompt=JSON.parse(JSON.parse(options.body).messages[1].content);calls.push({question:prompt.question,compare:Object.hasOwn(prompt,'platformAnswer')});return __aiResponse(__comparison('consistent','Recovered comparison'));};
+    await __test.runStage3();return {pending,rows:__test.data,calls,stage:__test.state.stage};
+  },question());
+  assert.equal(result.pending.calls,6);assert.equal(result.pending.paused,false);assert.equal(result.pending.stage,4);
+  const bad=result.pending.rows[0],good=result.pending.rows[1];
+  assert.equal(bad.s3_done,false);assert.equal(bad.AIReview.status,'generated');assert.equal(bad.AIError.phase,'comparison');assert.equal(bad.AIError.category,'format');assert.equal(bad.AIError.attempts,3);assert.equal(bad.AIError.maxAttempts,3);
+  assert.equal(good.s3_done,true);assert.equal(good.AIError,undefined);assert.equal(good.AIReview.status,'consistent');
+  assert.equal(result.calls.length,7);assert.equal(result.calls[6].compare,true);assert.equal(result.rows[0].AIReview.independentAnswer,bad.AIReview.independentAnswer);
+  assert.equal(result.rows[0].AIError,undefined);assert.equal(result.rows[0].ExtractionWarning,'Existing platform warning');assert.equal(result.rows[0].s3_done,true);
+}));
+
+test('answer review recovery: historical no-option issues survive comparison and repeated resumes without regeneration',()=>withReview(async page=>{
+  const result=await page.evaluate(async base=>{
+    const results=[];
+    for(const ownConflict of [false,true]) {
+      const row=structuredClone(base);__test.setData([row]);__test.state.stage=3;__test.state.isPaused=false;let calls=0;
+      const issue={category:'no_valid_option',explanation:ownConflict?'Comparison retains a no-option concern':'Independent assessment found no valid option'};
+      __fetch=async()=>__aiResponse(++calls===1
+        ? __independent('Independent reasoning','Single',ownConflict?{}:{optionIds:[],issues:[issue]})
+        : __comparison('different','Comparison recommends a conditional alternative','Single',ownConflict?{issues:[issue]}:{}));
+      await __test.runStage3();const first=JSON.stringify(row.AIReview),valid=!!__test.getValidAiReview(row);
+      for(let repeat=0;repeat<3;repeat++){__test.state.stage=3;await __test.runStage3();}
+      results.push({row,calls,valid,stable:first===JSON.stringify(row.AIReview)});
+    }
+    return results;
+  },question());
+  for(const resultRow of result) {
+    assert.equal(resultRow.calls,2);assert.equal(resultRow.valid,true);assert.equal(resultRow.stable,true);
+    assert.equal(resultRow.row.AIReview.status,'uncertain');assert.equal(resultRow.row.s3_done,true);assert.equal(resultRow.row.AIError,undefined);
+    assert.ok(resultRow.row.AIReview.comparison.issues.some(issue=>issue.category==='no_valid_option'));
+    assert.ok(resultRow.row.AIReview.comparison.issues.some(issue=>issue.category==='ambiguous'));
+    assert.deepEqual(resultRow.row.AIReview.comparison.optionIds,['option_1']);
+  }
+}));
+
+test('answer review recovery: an invalid stored comparison retains a valid current independent answer for comparison-only repair',()=>withReview(async page=>{
+  const result=await page.evaluate(async row=>{
+    __test.setData([row]);let calls=0;__fetch=async()=>__aiResponse(++calls===1?__independent('Do not generate this twice'):__comparison('consistent','Initial valid comparison'));
+    await __test.runStage3();row.AIReview.comparison.optionIds=['option_999'];
+    const before=structuredClone(row.AIReview);const bodies=[];__test.state.stage=3;
+    __fetch=async(_,options)=>{calls++;bodies.push(JSON.parse(options.body));return __aiResponse(__comparison('consistent','Repaired comparison'));};
+    await __test.runStage3();return {calls,bodies,row,before};
+  },question());
+  assert.equal(result.calls,3);assert.equal(result.bodies.length,1);assert.match(JSON.stringify(result.bodies[0].messages),/Do not generate this twice/);
+  assert.equal(result.row.AIReview.independentAnswer,result.before.independentAnswer);assert.equal(result.row.AIReview.independentInfo.generatedAt,result.before.independentInfo.generatedAt);
+  assert.deepEqual(result.row.AIReview.previousComparison.comparison.optionIds,['option_999']);assert.equal(result.row.AIReview.status,'consistent');
+}));
+
+test('answer review recovery: exhausted keys stop AI only and clearing keys permits the image stage without new requests',()=>withReview(async page=>{
+  const result=await page.evaluate(async base=>{
+    __test.setData([0,1,2].map(index=>({...structuredClone(base),GlobalUID:index,TopicGuid:'key-stop-'+index})));
+    let requests=0;__fetch=async()=>{requests++;return new Response('{}',{status:401});};
+    await __test.runStage3();const stopped={requests,paused:__test.state.isPaused,stage:__test.state.stage,service:__test.state.aiServiceError,outOfKeys:__test.state.outOfKeys,rows:structuredClone(__test.data)};
+    __test.keyManager.updateKeys('');__test.state.stage=3;await __test.runStage3();
+    return {stopped,requests,stage:__test.state.stage,paused:__test.state.isPaused,service:__test.state.aiServiceError,outOfKeys:__test.state.outOfKeys};
+  },question());
+  assert.equal(result.stopped.requests,1);assert.equal(result.stopped.paused,false);assert.equal(result.stopped.stage,4);assert.equal(result.stopped.service.code,'ALL_KEYS_EXHAUSTED');assert.equal(result.stopped.outOfKeys,true);
+  assert.equal(result.stopped.rows[0].AIError.phase,'independent');assert.ok(result.stopped.rows.every(row=>!row.s3_done&&!row.AIReview));
+  assert.equal(result.requests,1);assert.equal(result.stage,4);assert.equal(result.paused,false);assert.equal(result.service,undefined);assert.equal(result.outOfKeys,false);
+}));
+
+test('answer review recovery: a shared configuration failure preserves an in-flight independent answer and suppresses later comparisons',()=>withReview(async page=>{
+  const result=await page.evaluate(async base=>{
+    __setSettings({aiConcurrency:2,perKeyConcurrency:2});
+    __test.setData([0,1,2].map(index=>({...structuredClone(base),GlobalUID:index,TopicGuid:'config-stop-'+index,DetailHtml:base.DetailHtml.replace('Independent synthetic question','Config task '+index)})));
+    let requests=0,heldRelease;const held=new Promise(resolve=>{heldRelease=resolve;});
+    __fetch=async(_,options)=>{
+      requests++;const prompt=JSON.parse(JSON.parse(options.body).messages[1].content);
+      if(prompt.question.includes('Config task 0')) {await held;return __aiResponse(__independent('Save completed in-flight generation'));}
+      return new Response('{}',{status:400});
+    };
+    const running=__test.runStage3();
+    for(let spin=0;spin<100&&!__test.state.aiServiceError;spin++) await new Promise(resolve=>setTimeout(resolve,5));
+    const serviceSeen=!!__test.state.aiServiceError;heldRelease();await running;
+    return {requests,serviceSeen,service:__test.state.aiServiceError,paused:__test.state.isPaused,stage:__test.state.stage,rows:__test.data};
+  },question());
+  assert.equal(result.serviceSeen,true);assert.equal(result.requests,2);assert.equal(result.paused,false);assert.equal(result.stage,4);
+  assert.equal(result.service.code,'AI_REQUEST_CONFIG');assert.equal(result.rows[0].AIReview.status,'generated');assert.equal(result.rows[0].AIReview.independentAnswer,'Save completed in-flight generation');assert.equal(result.rows[0].s3_done,false);
+  assert.equal(result.rows[1].AIError.category,'request');assert.equal(result.rows[1].AIError.retryable,false);assert.ok(!result.rows[2].AIReview);
 }));

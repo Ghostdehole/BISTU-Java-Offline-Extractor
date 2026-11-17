@@ -70,7 +70,11 @@ test('malformed parameters, noncanonical data and excessive KDF work are rejecte
   const crypto = adapter(false), key = new Uint8Array(32);
   await assert.rejects(crypto.deriveKey(password,{...config,iterations:599999}),/参数/);
   await assert.rejects(crypto.deriveKey(password,{...config,iterations:999999999}),/参数/);
-  await assert.rejects(crypto.createSession('short'),/12–256/);
+  await assert.rejects(crypto.createSession('abc'),/4–256/);
+  const minimum = await crypto.createSession('abcd');
+  const envelope = await crypto.encryptText('Synthetic four-character boundary',minimum,'reader');
+  assert.equal((await adapter(true).decryptText(envelope,'abcd','reader')).text,'Synthetic four-character boundary');
+  minimum.key.fill(0);
   await assert.rejects(crypto.decryptBytes({iv:'bad',data:'bad'},key,'test'),/编码/);
   await assert.rejects(crypto.decryptBytes({iv:Buffer.alloc(12).toString('base64'),data:''},key,'test'),/不完整/);
 });
