@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BISTU Java 离线题库提取工具
 // @namespace    http://tampermonkey.net/
-// @version      7.20.0
+// @version      7.20.1
 // @description  练习优先，作业补题去重；题干、选项与原图离线导出，支持断点恢复和可选 AI 解答
 // @match        http://10.148.168.66/Manage/Practice/index*
 // @match        https://10.148.168.66/Manage/Practice/index*
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '7.20.0'; // Keep in sync with userscript @version.
+    const SCRIPT_VERSION = '7.20.1'; // Keep in sync with userscript @version.
 
     if (window.top !== window.self) return;
 
@@ -78,12 +78,13 @@
         listConcurrency: ['列表并发', 6, 1, 32], detailConcurrency: ['详情与平台验证并发', 6, 1, 32],
         aiConcurrency: ['AI 总并发', 6, 1, 32], imageConcurrency: ['图片下载并发', 6, 1, 32],
         perKeyConcurrency: ['单个 Key 并发上限', 2, 1, 32], pageSize: ['列表每页题数', 10, 1, 100],
-        platformTimeoutMs: ['平台请求超时（毫秒）', 30000, 1000, 300000], platformAttempts: ['平台读取总尝试次数', 3, 1, 10],
+        platformTimeoutMs: ['平台请求超时（毫秒）', 30000, 1000, 300000], platformAttempts: ['平台读取总尝试次数', 6, 1, 20],
         platformDelayMs: ['平台请求间隔（毫秒）', 100, 0, 10000], platformRetryDelayMs: ['平台重试基础间隔（毫秒）', 500, 0, 30000],
         multipleMaxOptions: ['多选枚举选项上限', 8, 1, 20], imageTimeoutMs: ['图片请求超时（毫秒）', 30000, 1000, 300000],
-        imageAttempts: ['图片总尝试次数', 3, 2, 10], imageRetryDelayMs: ['图片重试间隔（毫秒）', 500, 0, 30000],
+        imageAttempts: ['图片总尝试次数', 6, 2, 20], imageRetryDelayMs: ['图片重试间隔（毫秒）', 500, 0, 30000],
         imageDecodeTimeoutMs: ['图片解码超时（毫秒）', 10000, 1000, 60000], imageMaxDimension: ['AI 图片最长边（像素）', 8192, 512, 8192],
-        aiTimeoutMs: ['AI 请求超时（毫秒）', 180000, 1000, 900000], aiAttempts: ['AI 临时错误总尝试次数', 3, 1, 10],
+        aiTimeoutMs: ['AI 请求超时（毫秒）', 180000, 1000, 900000], aiAttempts: ['AI 临时错误总尝试次数', 5, 1, 20],
+        aiFormatAttempts: ['AI 结构化结果总尝试次数', 3, 1, 5],
         aiRetryDelayMs: ['AI 退避基础间隔（毫秒）', 1000, 0, 60000], aiMaxRetryDelayMs: ['AI 退避上限（毫秒）', 30000, 1000, 600000],
         aiRequestIntervalMs: ['每个 Key 请求间隔（毫秒）', 0, 0, 60000], maxTokens: ['单次输出上限（含思考 tokens）', 32768, 1, 393216],
         temperature: ['非思考模式温度', 0.2, 0, 2, 0.1], ocrTimeoutMs: ['OCR 任务超时（毫秒）', 60000, 1000, 300000],
@@ -119,12 +120,12 @@
             ['采集范围与平台', '练习页筛选决定练习范围；作业按当前班级、学期与语言补题，重复题保留练习内容。', ['includeHomework','pageSize','listConcurrency','detailConcurrency','multipleMaxOptions','platformTimeoutMs','platformAttempts','platformDelayMs','platformRetryDelayMs']],
             ['模型选择', '程序题优先保留平台参考程序；没有平台答案时才调用 AI。', ['model','programModel','visionModel']],
             ['AI 解答与复核', '忠实原题独立作答，再比较平台答案；多解、题面问题和版本差异分别说明。题面指定版本优先，默认不启用预览特性。复核增加调用，双方答案均保留。', ['answerReviewMode','javaTarget','thinking','reasoningEffort','maxTokens','temperature']],
-            ['AI 请求调度', '多个 Key 按空闲程度与轮询分配，同一账号仍共用服务端额度。', ['aiConcurrency','perKeyConcurrency','aiTimeoutMs','aiAttempts','aiRetryDelayMs','aiMaxRetryDelayMs','aiRequestIntervalMs']],
+            ['AI 请求调度', '失败仅重试未完成步骤；单题多次失败后保留断点并继续其它题。多个 Key 按空闲程度与轮询分配，同一账号仍共用服务端额度。', ['aiConcurrency','perKeyConcurrency','aiTimeoutMs','aiAttempts','aiFormatAttempts','aiRetryDelayMs','aiMaxRetryDelayMs','aiRequestIntervalMs']],
             ['题图与 OCR', '离线原图保持原文件；最长边设置只影响 AI 输入。OCR 纠错开启后会增加一次调用。', ['imageMode','ocrClean','imageConcurrency','imageTimeoutMs','imageAttempts','imageRetryDelayMs','imageDecodeTimeoutMs','imageMaxDimension','ocrTimeoutMs']],
-            ['发布与密码', '分享网站只上传 index.html 和带版本号的 question-images.*.pack.js。原始 images 是明文备份，请勿公开上传；可见内容仍可能被保存或截图。密码至少 12 个字符，请妥善保管。', ['exportProtection']],
+            ['发布与密码', '分享网站只上传 index.html 和带版本号的 question-images.*.pack.js。原始 images 是明文备份，请勿公开上传；可见内容仍可能被保存或截图。密码至少 4 个字符，请妥善保管。', ['exportProtection']],
             ['断点与面板', '暂停后可调整设置；已开始扫描的每页题数沿用断点。Key 不写入断点。', ['resumeSettings','dependencyTimeoutMs','logLimit']]
         ];
-        return `<details id="bistu-settings" open><summary><span>运行参数</span><span class="bistu-summary-meta">${Object.keys(SETTING_FIELDS).length + Object.keys(SETTING_OPTIONS).length + Object.keys(MODEL_DEFAULTS).length} 项 · 按任务分组</span></summary><div class="bistu-settings-content">${groups.map(([title,description,keys]) => `<fieldset class="bistu-setting-group"><legend>${title}</legend><p class="bistu-help">${description}</p><div class="bistu-settings-grid">${keys.map(field).join('')}${keys.includes('exportProtection') ? `<label class="bistu-field" for="bistu-export-password"><span>导出密码 / 导入包密码</span><input id="bistu-export-password" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="密码不写入文件" spellcheck="false"></label><label class="bistu-field" for="bistu-export-password-confirm"><span>确认导出密码</span><input id="bistu-export-password-confirm" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="再次输入密码" spellcheck="false"></label>` : ''}</div></fieldset>`).join('')}<p class="bistu-help bistu-setting-note">平台作答提交不自动重试。多选组合最多为 2ⁿ−1，调高选项上限会显著增加请求。</p><button type="button" id="bistu-settings-reset" class="bistu-button bistu-button-secondary">恢复默认设置</button></div><datalist id="bistu-model-options"><option value="deepseek-flash"><option value="deepseek-v4-pro"></datalist></details>`;
+        return `<details id="bistu-settings" open><summary><span>运行参数</span><span class="bistu-summary-meta">${Object.keys(SETTING_FIELDS).length + Object.keys(SETTING_OPTIONS).length + Object.keys(MODEL_DEFAULTS).length} 项 · 按任务分组</span></summary><div class="bistu-settings-content">${groups.map(([title,description,keys]) => `<fieldset class="bistu-setting-group"><legend>${title}</legend><p class="bistu-help">${description}</p><div class="bistu-settings-grid">${keys.map(field).join('')}${keys.includes('exportProtection') ? `<label class="bistu-field" for="bistu-export-password"><span>导出密码 / 导入包密码</span><input id="bistu-export-password" type="password" autocomplete="new-password" minlength="4" maxlength="256" placeholder="密码不写入文件" spellcheck="false"></label><label class="bistu-field" for="bistu-export-password-confirm"><span>确认导出密码</span><input id="bistu-export-password-confirm" type="password" autocomplete="new-password" minlength="4" maxlength="256" placeholder="再次输入密码" spellcheck="false"></label>` : ''}</div></fieldset>`).join('')}<p class="bistu-help bistu-setting-note">平台作答提交不自动重试。多选组合最多为 2ⁿ−1，调高选项上限会显著增加请求。</p><button type="button" id="bistu-settings-reset" class="bistu-button bistu-button-secondary">恢复默认设置</button></div><datalist id="bistu-model-options"><option value="deepseek-flash"><option value="deepseek-v4-pro"></datalist></details>`;
     }
     function getSettings() {
         const settings = {};
@@ -158,7 +159,7 @@
         if (!confirm) return password;
         if (getSettings().exportProtection === 'none') return '';
         const fail = (message, fieldId) => { const error = new Error(message); error.fieldId = fieldId; throw error; };
-        if (password.length < 12 || password.length > 256) fail('请设置 12–256 个字符的导出密码；密码仅保留在当前页面。', 'bistu-export-password');
+        if (password.length < 4 || password.length > 256) fail('请设置 4–256 个字符的导出密码；密码仅保留在当前页面。', 'bistu-export-password');
         if (password !== document.getElementById('bistu-export-password-confirm')?.value) fail('两次导出密码不一致。', 'bistu-export-password-confirm');
         return password;
     }
@@ -204,6 +205,7 @@
         async acquire() {
             while (true) {
                 if (globalState.isPaused) throw new Error('PAUSED');
+                if (globalState.aiServiceError) throw Object.assign(aiRequestError(globalState.aiServiceError.message, false, 'AI_SERVICE_PAUSED'), {stopAi:true});
                 const available = this.entries.filter(entry => !entry.disabled);
                 if (!available.length) throw new Error('ALL_KEYS_EXHAUSTED');
                 const settings = getSettings(), now = Date.now();
@@ -767,19 +769,38 @@
     const fetchSafe = async (url, method, data = null, dataType = "json", timeout = getSettings().platformTimeoutMs, requestOptions = {}) => {
         const requestUrl = new URL(url, window.location.origin);
         const retryableRead = requestUrl.origin === window.location.origin && [PLATFORM_CONFIG.API.GET_LIST, '/Manage/Practice/JumpToPracticeTopic', '/Manage/StudentJob/Index', '/Manage/StudentJob/JobStudentsScore', '/Manage/TeacherJobScoreSearch/StudentJobDetail'].includes(requestUrl.pathname);
-        const attempts = retryableRead ? getSettings().platformAttempts : 1;
+        const settings = getSettings(), attempts = retryableRead ? settings.platformAttempts : 1;
         for (let attempt = 0; attempt < attempts; attempt++) {
+            if (globalState.isPaused) throw new Error('PAUSED');
             try {
                 return await new Promise((resolve, reject) => {
                     $.ajax({ ...requestOptions, url, type: method, data, dataType, timeout, success: resolve,
-                        error: (xhr, status) => reject(new Error(`平台请求失败 (${xhr && xhr.status || status || '网络错误'}): ${url.split('?')[0]}`)) });
+                        error: (xhr, status) => {
+                            const error = new Error(`平台请求失败 (${xhr && xhr.status || status || '网络错误'}): ${requestUrl.pathname}`);
+                            error.status = Number(xhr?.status) || 0;
+                            error.retryable = !error.status || [408,425,429,500,502,503,504].includes(error.status) || status === 'parsererror' && error.status === 200;
+                            error.retryAfterMs = retryAfterDelay(xhr?.getResponseHeader?.('Retry-After'));
+                            reject(error);
+                        } });
                 });
             } catch (error) {
-                if (globalState.isPaused || attempt + 1 === attempts) throw error;
-                await new Promise(resolve => setTimeout(resolve, getSettings().platformRetryDelayMs * (attempt + 1)));
+                if (globalState.isPaused || !error.retryable || attempt + 1 === attempts) throw error;
+                const delay = Math.max(error.retryAfterMs || 0, Math.min(30000, settings.platformRetryDelayMs * 2 ** attempt));
+                addLog(`平台读取暂时失败，${Math.ceil(delay / 1000)} 秒后自动重试 (${attempt + 2}/${attempts})：${requestUrl.pathname}`, 'warning');
+                await pauseAwareDelay(delay);
             }
         }
     };
+
+    function retryAfterDelay(value) {
+        if (!value) return 0;
+        const seconds = Number(value);
+        return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Math.max(0, Date.parse(value) - Date.now()) || 0;
+    }
+
+    function aiRequestError(message, retryable = true, code = 'AI_REQUEST_FAILED') {
+        const error = new Error(message); error.retryable = retryable; error.code = code; return error;
+    }
 
     async function fetchWithTimeout(url, options = {}, timeout = 60000) {
         const controller = new AbortController();
@@ -902,17 +923,21 @@
         if (isThinking) payload.reasoning_effort = settings.reasoningEffort;
         else payload.temperature = settings.temperature;
         const body = JSON.stringify(payload);
-        if (new TextEncoder().encode(body).length > 48 * 1024 * 1024) throw new Error('AI 请求超过官方 48MiB 上限，请降低 AI 图片最长边后重试；原图不会修改。');
+        if (new TextEncoder().encode(body).length > 48 * 1024 * 1024) throw aiRequestError('AI 请求超过官方 48MiB 上限，请降低 AI 图片最长边后重试；原图不会修改。', false, 'AI_REQUEST_CONFIG');
         let transientFailures = 0;
         while (true) {
+            if (globalState.aiServiceError) {
+                const error = aiRequestError(globalState.aiServiceError.message, false, 'AI_SERVICE_PAUSED'); error.stopAi = true; throw error;
+            }
             const lease = await keyManager.acquire();
             let delay = 0, retryError = null;
             try {
+                if (globalState.aiServiceError) throw Object.assign(aiRequestError(globalState.aiServiceError.message, false, 'AI_SERVICE_PAUSED'), {stopAi:true});
                 const total = globalState.aiUsage || (globalState.aiUsage = {requests:0,successfulResponses:0,promptTokens:0,completionTokens:0,totalTokens:0,cacheHitTokens:0,cacheMissTokens:0});
                 total.requests++;
                 let response;
                 try { response = await fetchWithTimeout('https://api.deepseek.com/chat/completions', {method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${lease.key}`},body}, settings.aiTimeoutMs); }
-                catch (error) { retryError = new Error(error.name === 'AbortError' ? 'AI 请求超时（服务端可能已计费）' : 'AI 网络请求失败'); }
+                catch (error) { retryError = aiRequestError(error.name === 'AbortError' ? 'AI 请求超时（服务端可能已计费）' : 'AI 网络请求失败'); }
                 if (response) {
                     if ([401,402].includes(response.status)) {
                         lease.disable();
@@ -920,36 +945,42 @@
                         continue;
                     }
                     if (!response.ok) {
-                        if (![408,429,500,502,503,504].includes(response.status)) throw new Error(`AI 请求被拒绝 (HTTP ${response.status})，已暂停，请检查模型和参数。`);
-                        retryError = new Error(`AI 服务暂时不可用 (HTTP ${response.status})`);
+                        if (![408,429,500,502,503,504].includes(response.status)) {
+                            const error = aiRequestError(`AI 请求被拒绝 (HTTP ${response.status})，请检查模型和参数。`, false, 'AI_REQUEST_CONFIG');
+                            error.stopAi = true; throw error;
+                        }
+                        retryError = aiRequestError(`AI 服务暂时不可用 (HTTP ${response.status})`);
                         if (response.status === 429) {
-                            const retryAfter = response.headers?.get?.('retry-after');
-                            const seconds = Number(retryAfter);
-                            delay = retryAfter ? (Number.isFinite(seconds) ? Math.max(0,seconds * 1000) : Math.max(0,Date.parse(retryAfter) - Date.now()) || 0) : 0;
-                            if (delay > settings.aiMaxRetryDelayMs) throw new Error('AI 服务要求较长时间后重试，已暂停；请稍后恢复，避免持续限流。');
+                            delay = retryAfterDelay(response.headers?.get?.('retry-after'));
                             delay = Math.max(delay, Math.min(settings.aiMaxRetryDelayMs, settings.aiRetryDelayMs * 2 ** transientFailures));
                             keyManager.coolDown(delay);
                         }
                     } else {
                         let json;
-                        try { json = await response.json(); } catch (_) { throw new Error('AI 返回无效 JSON，未保存答案；请稍后重试。'); }
+                        try { json = await response.json(); } catch (_) { throw aiRequestError('AI 返回无效 JSON，未保存答案。'); }
                         const choice = json?.choices?.[0], message = choice?.message;
                         const content = message?.content;
                         const complete = choice?.finish_reason === 'stop' && typeof content === 'string' && !!content.trim() && !message.refusal && !(message.tool_calls?.length);
                         const usage = recordAiUsage(json, complete);
                         if (!complete) {
-                            if (choice?.finish_reason === 'length') throw new Error('AI 输出达到 token 上限，答案不完整；请增大输出上限或降低思考强度后恢复。');
-                            throw new Error(`AI 返回空答案、无效响应或未完成内容（${String(choice?.finish_reason || '缺少结束标记').replace(/[^a-z_]/gi,'').slice(0,50)}），未标记完成。`);
+                            if (choice?.finish_reason === 'length') throw aiRequestError('AI 输出达到 token 上限，答案不完整；请增大输出上限或降低思考强度后恢复。', false, 'AI_REQUEST_CONFIG');
+                            throw aiRequestError(`AI 返回空答案、无效响应或未完成内容（${String(choice?.finish_reason || '缺少结束标记').replace(/[^a-z_]/gi,'').slice(0,50)}），未标记完成。`, !message?.refusal && choice?.finish_reason !== 'content_filter');
                         }
                         const answer = options.rawContent ? content.trim() : content.replace(/^```[a-zA-Z]*\r?\n?|\r?\n?```$/g, '').trim();
-                        if (!answer) throw new Error('AI 返回空答案或无效响应。');
+                        if (!answer) throw aiRequestError('AI 返回空答案或无效响应。');
                         if (options.item) options.item.AIInfo = {model:typeof json.model === 'string' ? json.model : model,thinking:isThinking,generatedAt:new Date().toISOString(),usage};
                         return answer;
                     }
                 }
+            } catch (error) {
+                if (!error.retryable) throw error;
+                retryError = error;
             } finally { lease.release(); }
             transientFailures++;
-            if (transientFailures >= settings.aiAttempts) throw retryError || new Error('AI 请求失败');
+            if (transientFailures >= settings.aiAttempts) {
+                const error = retryError || aiRequestError('AI 请求失败');
+                error.aiAttempts = transientFailures; error.aiMaxAttempts = settings.aiAttempts; throw error;
+            }
             delay = Math.max(delay, Math.min(settings.aiMaxRetryDelayMs, settings.aiRetryDelayMs * 2 ** (transientFailures - 1)));
             addLog(`AI 暂时失败，等待 ${Math.ceil(delay / 1000)} 秒后重试（${transientFailures}/${settings.aiAttempts - 1}）。`, 'warning');
             await pauseAwareDelay(delay);
@@ -1029,7 +1060,8 @@
     const pendingImageFetches = new Map();
     async function ensureQueuedImage(url, data) {
         if (data.buffer) return data.buffer;
-        if (!pendingImageFetches.has(url)) pendingImageFetches.set(url, fetchImageBuffer(url).then(buffer => { data.buffer = buffer; return buffer; }).finally(() => pendingImageFetches.delete(url)));
+        if (!pendingImageFetches.has(url)) pendingImageFetches.set(url, fetchImageBuffer(url).then(buffer => { data.buffer = buffer; return buffer; })
+            .catch(error => { error.imageUrl = url; throw error; }).finally(() => pendingImageFetches.delete(url)));
         return pendingImageFetches.get(url);
     }
 
@@ -2348,11 +2380,57 @@
         const result = {...value, optionIds:[...value.optionIds], issues:value.issues.map(issue => ({category:issue.category,explanation:issue.explanation.trim()})), javaVersions:value.javaVersions.map(version => version.trim())};
         if (item.QuestionType === 'Single' && result.optionIds.length > 1 && !result.issues.some(issue => issue.category === 'multiple_correct')) result.issues.push({category:'multiple_correct',explanation:'本题标为单选，但模型判断有多个原选项成立，不能强制压成单个答案。'});
         if (ids.size && !result.optionIds.length && !result.issues.length) throw new Error('AI 未给出原选项，也未说明无解或不确定原因。');
-        if (result.issues.some(issue => issue.category === 'no_valid_option') && result.optionIds.length) throw new Error('AI 同时声称无有效选项并选择了选项，结果矛盾。');
+        // Comparison issues also retain the independent answer's historical
+        // assessment. A later suggested option may disagree with that history;
+        // keep both as uncertain rather than rejecting/re-generating the answer.
+        if (!comparison && result.issues.some(issue => issue.category === 'no_valid_option') && result.optionIds.length) throw new Error('AI 同时声称无有效选项并选择了选项，结果矛盾；独立答案须重新核对，不能同时给出这两种判断。');
         if (result.issues.some(issue => issue.category === 'version_dependent') && !result.javaVersions.length) throw new Error('AI 标注版本差异但没有说明适用版本。');
         if (comparison) result.reason = result.reason.trim();
         else { result.answer = result.answer.trim(); result.explanation = result.explanation.trim(); }
         return result;
+    }
+    async function requestAiAssessment(item, phase, request, comparison = false) {
+        const settings = getSettings(), maxAttempts = settings.aiFormatAttempts ?? 3;
+        let feedback = '';
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (globalState.isPaused) throw new Error('PAUSED');
+            // Transport retries belong to requestDeepSeek. Never multiply their
+            // budget by retrying an exhausted HTTP/configuration failure here.
+            const raw = await request(feedback);
+            let result, failure;
+            try {
+                let value;
+                try { value = JSON.parse(raw); } catch (_) { throw new Error('AI 未返回可解析的 JSON 对象；请只输出完整 JSON，不要 Markdown 或前后说明。'); }
+                result = validateAiAssessment(value,item,comparison);
+            } catch (error) { failure = error; }
+            if (!failure) return result;
+            failure.code = 'AI_FORMAT_INVALID'; failure.retryable = true;
+            failure.aiAttempts = attempt; failure.aiMaxAttempts = maxAttempts;
+            if (attempt === maxAttempts) throw failure;
+            feedback = 'Previous output failed validation: ' + failure.message + ' Return a corrected complete JSON object using exactly the required fields and original option IDs. Re-evaluate contradictory conclusions; never change the original problem to satisfy validation.';
+            addLog(`题目 ${item.GlobalUID} 的${phase === 'comparison' ? '比较' : '独立作答'}格式未通过校验，自动重试 ${attempt + 1}/${maxAttempts}：${failure.message}`,'warning');
+            await pauseAwareDelay(Math.min(settings.aiMaxRetryDelayMs,settings.aiRetryDelayMs * 2 ** (attempt - 1)));
+        }
+    }
+    function clearAiFailure(item) {
+        const previous = item.AIError?.warning;
+        if (previous) {
+            const warning = String(item.ExtractionWarning || '').split('\n').filter(line => line !== previous).join('\n');
+            if (warning) item.ExtractionWarning = warning; else delete item.ExtractionWarning;
+        }
+        delete item.AIError;
+    }
+    function recordAiFailure(item, phase, error) {
+        clearAiFailure(item);
+        const message = redactPanelText(error?.message || 'AI 处理失败').slice(0,600);
+        const name = {independent:'独立作答',comparison:'答案比较',answer:'答案生成',ocr:'OCR 纠错',material:'图片读取'}[phase] || 'AI 处理';
+        const warning = `AI 待处理（${name}）：${message}；当前题已保留，恢复后重试此步骤。`;
+        item.AIError = {version:1,phase,category:error.code === 'AI_FORMAT_INVALID' ? 'format' : error.code === 'AI_INPUT_CHANGED' ? 'input_changed' : phase === 'material' || imageQueue.has(error.imageUrl) ? 'image' : 'request',
+            message,attempts:error.aiAttempts || 1,maxAttempts:error.aiMaxAttempts || 1,retryable:error.retryable !== false,updatedAt:new Date().toISOString(),warning,
+            imageUrl:typeof error.imageUrl === 'string' && imageQueue.has(error.imageUrl) ? error.imageUrl : undefined};
+        item.s3_done = false;
+        item.ExtractionWarning = [item.ExtractionWarning,warning].filter(Boolean).join('\n');
+        return warning;
     }
     function aiReviewFingerprint(item, settings = getSettings()) {
         const stableHtml = html => {
@@ -2364,7 +2442,7 @@
         return JSON.stringify([2, 'clean-options-image-references:1', aiReviewPolicy(settings), item.QuestionType, item.Title || '', item.Requirement || '', stableHtml(aiQuestionDocument(item).innerHTML), item.BlankCount ?? null,
             stableHtml(aiPlatformAnswer(item)), item.Answer ?? null, !!item.PlatformAnswerUnresolved]);
     }
-    function getValidAiReview(item) {
+    function getValidAiReview(item, generationOnly = false) {
         const review = item.AIReview;
         if (item.QuestionType === 'Program' || !review || review.version !== 2 || !['generated','consistent','different','uncertain'].includes(review.status) ||
             typeof review.independentAnswer !== 'string' || !review.independentAnswer.trim() || typeof review.promptText !== 'string' || review.fingerprint !== aiReviewFingerprint(item)) return null;
@@ -2372,8 +2450,9 @@
             if (!review.independentAssessment || Object.keys(review.independentAssessment).sort().join(',') !== 'explanation,issues,javaVersions,optionIds') return null;
             const independent = validateAiAssessment({answer:review.independentAnswer,...review.independentAssessment},item);
             if (independent.issues.length !== review.independentAssessment.issues.length) return null;
-            if (review.status !== 'generated') {
+            if (review.status !== 'generated' && !generationOnly) {
                 const comparison = validateAiAssessment(review.comparison,item,true);
+                if (comparison.issues.some(issue => issue.category === 'no_valid_option') && comparison.optionIds.length && review.status !== 'uncertain') return null;
                 if (comparison.verdict !== review.status || review.status === 'consistent' && (comparison.issues.length || review.independentAssessment.issues.length || comparison.platformAssessment !== 'supported' || comparison.aiAssessment !== 'supported' ||
                     JSON.stringify([...comparison.optionIds].sort()) !== JSON.stringify([...independent.optionIds].sort()))) return null;
                 const platformIds = review.status === 'consistent' ? platformChoiceIds(item) : null;
@@ -2389,7 +2468,18 @@
     }
     function synchronizeAiReview(item, settings = getSettings()) {
         if (item.QuestionType === 'Program' || settings.answerReviewMode !== 'double-check') return;
-        const review = getValidAiReview(item);
+        let review = getValidAiReview(item);
+        if (!review) {
+            const generation = getValidAiReview(item,true);
+            if (generation) {
+                // A bad comparison does not invalidate a separately validated,
+                // current blind answer. Keep the old comparison for audit.
+                generation.previousComparison = {status:generation.status,comparison:generation.comparison,comparisonInfo:generation.comparisonInfo,comparedAt:generation.comparedAt};
+                generation.status = 'generated';
+                delete generation.comparison; delete generation.comparisonInfo; delete generation.comparedAt;
+                review = generation;
+            }
+        }
         // Keep old answers/reviews readable, including without keys. Only a new
         // successful blind assessment may replace them; v1 is never certified as v2.
         if (review) item.s3_done = !aiPlatformAnswer(item) || review.status !== 'generated';
@@ -2447,10 +2537,7 @@
         if (question.images.length && model === 'deepseek-v4-pro') throw new Error('含图片题需要支持视觉的模型。');
         const schema = 'Return strictly one JSON object with exactly: answer (nonempty answer text), optionIds (array of original option IDs; [] for non-choice questions or no determinable valid option), issues (array of {category,explanation}; category in ' + JSON.stringify(AI_REVIEW_ISSUES) + '), explanation (nonempty reasoning), javaVersions (array of version/condition strings, required when version_dependent is present). No Markdown fences or extra keys. Do not invent a platform answer; none has been supplied.';
         const example = JSON.stringify({answer:'Example answer text only',optionIds:options.length ? [options[0].id] : [],issues:[],explanation:'Example reasoning text only',javaVersions:[]});
-        const raw = await requestDeepSeek('Independently solve and assess this Java exercise before seeing any platform answer. ' + aiAssessmentInstructions() + ' ' + schema + ' JSON format-only example, not an answer or a suggested choice for this question: ' + example,user,settings.thinking === 'enabled',{model,item:metadata,rawContent:true,jsonObject:true});
-        let parsed;
-        try { parsed = JSON.parse(raw); } catch (_) { throw new Error('AI 独立作答未返回有效结构化 JSON，未保存或覆盖原答案。'); }
-        const result = validateAiAssessment(parsed,item);
+        const result = await requestAiAssessment(item,'independent',feedback => requestDeepSeek('Independently solve and assess this Java exercise before seeing any platform answer. ' + aiAssessmentInstructions() + ' ' + schema + ' JSON format-only example, not an answer or a suggested choice for this question: ' + example + (feedback ? '\n' + feedback : ''),user,settings.thinking === 'enabled',{model,item:metadata,rawContent:true,jsonObject:true}));
         const {answer,...assessment} = result;
         return {answer,assessment,info:metadata.AIInfo};
     }
@@ -2469,13 +2556,17 @@
         if (images.length && model === 'deepseek-v4-pro') throw new Error('比较答案包含图片，请选择支持视觉的含图片题模型。');
         const schema = 'Return strictly one JSON object with exactly: verdict (consistent|different|uncertain), reason (nonempty explanation), optionIds (your suggested original option IDs, not a certified truth), issues (array of {category,explanation}; category in ' + JSON.stringify(AI_REVIEW_ISSUES) + '), platformAssessment and aiAssessment (each supported|unsupported|conditional|uncertain), javaVersions (array of relevant version/condition strings). Retain all substantive problem or version issues even when the two answers agree. consistent is allowed only with no issues and both assessments supported. If statements depend on assumptions or version, mark conditional or uncertain and explain. No Markdown or additional keys.';
         const example = JSON.stringify({verdict:'uncertain',reason:'Example uncertainty explanation only',optionIds:[],issues:[{category:'missing_information',explanation:'Example missing condition only'}],platformAssessment:'uncertain',aiAssessment:'uncertain',javaVersions:[]});
-        const raw = await requestDeepSeek('Independently evaluate both proposed answers against the original Java exercise, then compare them. Neither platform nor AI identity gives an answer authority. Do not decide correctness merely from different choice letters or missing items in a textbook mnemonic; justify each claim from the complete question and options. Compare semantic answers and every blank in order, not superficial formatting. ' + aiAssessmentInstructions() + ' ' + schema + ' JSON format-only example, not a verdict for this question: ' + example,user,settings.thinking === 'enabled',{model,item:metadata,rawContent:true,jsonObject:true});
-        let comparison;
-        try { comparison = JSON.parse(raw); } catch (_) { throw new Error('AI 比较没有返回有效 JSON；已保留独立答案，恢复时仅重试比较。'); }
-        try { comparison = validateAiAssessment(comparison,item,true); }
-        catch (error) { throw new Error(error.message + ' 已保留独立答案，恢复时仅重试比较。'); }
+        let comparison = await requestAiAssessment(item,'comparison',feedback => requestDeepSeek('Independently evaluate both proposed answers against the original Java exercise, then compare them. Neither platform nor AI identity gives an answer authority. Do not decide correctness merely from different choice letters or missing items in a textbook mnemonic; justify each claim from the complete question and options. Compare semantic answers and every blank in order, not superficial formatting. ' + aiAssessmentInstructions() + ' ' + schema + ' JSON format-only example, not a verdict for this question: ' + example + (feedback ? '\n' + feedback : ''),user,settings.thinking === 'enabled',{model,item:metadata,rawContent:true,jsonObject:true}),true);
+        const ownChoiceConflict = comparison.issues.some(issue => issue.category === 'no_valid_option') && comparison.optionIds.length;
         comparison.issues = mergeAiIssues(independentAssessment.issues,comparison.issues);
         comparison.javaVersions = [...new Set([...independentAssessment.javaVersions,...comparison.javaVersions])];
+        if (comparison.issues.some(issue => issue.category === 'no_valid_option') && comparison.optionIds.length) {
+            comparison.issues = mergeAiIssues(comparison.issues,[{category:'ambiguous',explanation:ownChoiceConflict
+                ? '复核同时保留了“无有效选项”和具体推荐选项，判断尚有矛盾，保留双方内容供人工核对。'
+                : '独立作答曾判断无有效选项，但复核推荐了具体选项；这是两阶段尚未解决的分歧，不应丢弃独立答案重新生成。'}]);
+            comparison.verdict = 'uncertain';
+            comparison.reason += ' “无有效选项”与推荐选项的判断均已保留，当前不能认证为一致。';
+        }
         if (comparison.verdict === 'consistent' && JSON.stringify([...comparison.optionIds].sort()) !== JSON.stringify([...independentAssessment.optionIds].sort())) {
             comparison.issues = mergeAiIssues(comparison.issues,[{category:'ambiguous',explanation:'独立作答与复核建议选择了不同的原选项，结构化判断相互矛盾，需人工核对。'}]);
         }
@@ -2493,6 +2584,13 @@
     async function runStage3() {
         if (homeworkEnabled() && !globalState.homeworkProgress?.done) throw new Error('必须先检查作业中的题目与平台答案，再进入 AI 阶段。');
         const settings = getSettings();
+        delete globalState.aiServiceError;
+        if (!keyManager.keys.length) globalState.outOfKeys = false;
+        const stopAiService = error => {
+            if (error.message === 'ALL_KEYS_EXHAUSTED') globalState.outOfKeys = true;
+            if (!globalState.aiServiceError) globalState.aiServiceError = {code:error.message === 'ALL_KEYS_EXHAUSTED' ? 'ALL_KEYS_EXHAUSTED' : error.code || 'AI_SERVICE_PAUSED',
+                message:redactPanelText(error.message).slice(0,600),updatedAt:new Date().toISOString()};
+        };
         for (const item of allData) {
             reconcilePlatformAnswer(item); synchronizeAiReview(item,settings);
             if (aiQuestionDocument(item).aiInputUnsafe) {
@@ -2501,11 +2599,13 @@
                 if (!lines.includes(notice)) item.ExtractionWarning = [...lines,notice].join('\n');
                 item.s3_done = false;
             }
+            if (item.s3_done && !needsAiWork(item,settings)) clearAiFailure(item);
         }
         if (allData.some(item => !item.s2_done)) throw new Error('必须先完成每道题的平台答案获取，再进入 AI 阶段。');
         const aiItems = allData.filter(item => needsAiWork(item,settings));
         if (!aiItems.length || !keyManager.getCount()) {
-            updateUI(3, !aiItems.length ? '当前可处理的 AI 解答与复核已完成' : '无 Key，保留原答案；未复核题不标记一致', true);
+            if (aiItems.length && keyManager.keys.length) stopAiService(new Error('ALL_KEYS_EXHAUSTED'));
+            updateUI(3, !aiItems.length ? '当前可处理的 AI 解答与复核已完成' : globalState.aiServiceError ? 'Key 均不可用，保留待处理题并继续图片下载' : '无 Key，保留原答案；未复核题不标记一致', true);
             if (!globalState.isPaused) globalState.stage = 4;
             return;
         }
@@ -2518,6 +2618,9 @@
         };
         addLog(`[AI] 平台内容已获取，处理 ${aiItems.length} 道待解答或待复核题；非程序题${settings.answerReviewMode === 'double-check' ? '先独立作答，有平台答案时再比较' : '仅补缺答案'}，程序题保留平台优先；总并发 ${settings.aiConcurrency}，每 Key 最多 ${settings.perKeyConcurrency} 个请求。`, 'ai');
         await runWithConcurrency(aiItems, settings.aiConcurrency, async (item, _, workerId) => {
+            if (globalState.aiServiceError) return;
+            let phase = 'material';
+            try {
             reconcilePlatformAnswer(item); synchronizeAiReview(item,settings);
             if (!needsAiWork(item,settings)) return;
             const doubleCheck = settings.answerReviewMode === 'double-check' && item.QuestionType !== 'Program';
@@ -2527,25 +2630,30 @@
             } catch (error) {
                 if (error.message === 'PAUSED') return;
                 item.s3_done = false; setImageWarning(item,true);
+                recordAiFailure(item,'material',error);
                 addLog(`[Worker ${workerId}] 题目 ${item.GlobalUID} 的题图暂不可用于 AI，保留未解并继续图片下载。`, 'warning');
                 return;
             }
             setImageWarning(item,false);
+            if (globalState.aiServiceError) return;
             if (question.ocrTexts.length && !review) {
+                phase = 'ocr';
                 const raw = question.ocrTexts.map((text,index) => '[' + question.ocrImageIds[index] + ']\n' + text).join('\n\n');
                 question.ocrSuggestion = settings.ocrClean ? await correctOcrText(raw) : '';
             }
             if (globalState.isPaused) return;
             if (!doubleCheck) {
                 if (reconcilePlatformAnswer(item) || item.PlatformAnswerUnresolved) return;
+                phase = 'answer';
                 const answer = await askDeepSeekQA(aiMaterialPromptText(question),item.QuestionType,question.images,item);
                 if (reconcilePlatformAnswer(item) || item.PlatformAnswerUnresolved) { delete item.AIInfo; return; }
                 item.SniffedAnswer = answer; item.IsAIAnswer = true; item.AnswerSource = 'ai'; item.s3_done = true;
             } else {
                 if (!review) {
+                    phase = 'independent';
                     const fingerprint = aiReviewFingerprint(item);
                     const generated = await generateIndependentAssessment(item,question);
-                    if (aiReviewFingerprint(item) !== fingerprint) throw new Error('题目或平台答案在独立作答期间改变，请恢复后重新核验。');
+                    if (aiReviewFingerprint(item) !== fingerprint) throw Object.assign(new Error('题目或平台答案在独立作答期间改变，请恢复后重新核验。'),{code:'AI_INPUT_CHANGED'});
                     review = item.AIReview = {version:2,status:'generated',fingerprint,policy:aiReviewPolicy(settings),options:aiOptionCatalog(item),
                         independentAnswer:generated.answer,independentAssessment:generated.assessment,promptText:question.text,
                         ocrOriginal:question.ocrTexts,ocrSuggestion:question.ocrSuggestion,
@@ -2555,16 +2663,23 @@
                 if (!aiPlatformAnswer(item)) {
                     item.SniffedAnswer = review.independentAnswer; item.IsAIAnswer = true; item.AnswerSource = 'ai'; item.AIInfo = review.independentInfo; item.s3_done = true;
                 } else {
-                    if (globalState.isPaused) return;
+                    if (globalState.isPaused || globalState.aiServiceError) return;
+                    phase = 'comparison';
                     const compared = await compareAiAnswer(item,question,review.independentAnswer,review.independentAssessment);
-                    if (aiReviewFingerprint(item) !== review.fingerprint) throw new Error('题目或平台答案在比较期间改变，请恢复后重新核验。');
+                    if (aiReviewFingerprint(item) !== review.fingerprint) throw Object.assign(new Error('题目或平台答案在比较期间改变，请恢复后重新核验。'),{code:'AI_INPUT_CHANGED'});
                     review.status = compared.comparison.verdict; review.comparison = compared.comparison; review.comparisonInfo = compared.info; review.comparedAt = new Date().toISOString();
                     item.s3_done = true;
                 }
             }
+            clearAiFailure(item);
             addLog(`[Worker ${workerId}] 题目 ${item.GlobalUID}：已保存${doubleCheck && aiPlatformAnswer(item) ? '独立答案与比较结果；平台答案保持原样' : 'AI 参考答案（未由平台验证）'}。`, 'success');
             updateUI(3, `AI 解答或复核已保存: ${allData.filter(row => row.s3_done).length} 题`);
             await yieldThread();
+            } catch (error) {
+                if (error.message === 'PAUSED' || error.code === 'AI_SERVICE_PAUSED') return;
+                if (error.message === 'ALL_KEYS_EXHAUSTED' || error.stopAi === true) stopAiService(error);
+                addLog(`[Worker ${workerId}] 题目 ${item.GlobalUID}：${recordAiFailure(item,phase,error)} ${globalState.aiServiceError ? '本轮停止新增 AI 请求，继续图片处理。' : '继续其它题目。'}`,'warning');
+            }
         });
         if (!globalState.isPaused) {
             const pending = aiItems.filter(item => needsAiWork(item,settings)).length;
@@ -2804,7 +2919,9 @@
                 consistent: countReview('consistent'), different: countReview('different'), uncertain: countReview('uncertain'),
                 generatedWithoutPlatform: reviews.filter(row => row.review?.status === 'generated' && !aiPlatformAnswer(row.item)).length,
                 awaitingComparison: reviews.filter(row => row.review?.status === 'generated' && !!aiPlatformAnswer(row.item)).length,
-                notReviewed: reviews.filter(row => !row.review).length },
+                notReviewed: reviews.filter(row => !row.review).length, serviceError:globalState.aiServiceError || null,
+                failures: allData.filter(item => item.AIError && needsAiWork(item)).map(item => ({globalUID:item.GlobalUID,phase:item.AIError.phase,
+                    category:item.AIError.category,message:item.AIError.message,attempts:item.AIError.attempts,maxAttempts:item.AIError.maxAttempts,retryable:item.AIError.retryable})) },
             settings: getSettings(), aiUsage: globalState.aiUsage || null,
             images: { expected: images.length, included, failed: images.filter(item => item.failed && !item.sourceUnavailable).length,
                 sourceUnavailable: missingAtSource.length,
@@ -3154,7 +3271,7 @@ THE SOFTWARE.
             } finally { secret.fill(0); }
         }
         async function createSession(password) {
-            if (typeof password !== 'string' || password.length < 12 || password.length > 256) throw new Error('导出密码须为 12–256 个字符。');
+            if (typeof password !== 'string' || password.length < 4 || password.length > 256) throw new Error('导出密码须为 4–256 个字符。');
             const config = {version:1,kdf:'PBKDF2-SHA256',iterations:ITERATIONS,salt:base64(random(16)),cipher:'AES-256-GCM'};
             return {key:await deriveKey(password,config),config};
         }
@@ -3245,7 +3362,7 @@ THE SOFTWARE.
         const valid = getValidAiReview(item);
         const saved = item.AIReview;
         const review = valid || (saved && typeof saved.independentAnswer === 'string' && saved.independentAnswer.trim() ? saved : null);
-        if (!review) return item.IsAIAnswer ? '' : '<p class="meta ai-review-status" data-review-status="pending">尚未完成 AI 复核。</p>';
+        if (!review) return item.IsAIAnswer ? '' : '<p class="meta ai-review-status ai-review-pending" data-review-status="pending">尚未完成 AI 复核。</p>';
         const status = valid ? review.status : 'legacy';
         const label = !valid ? (offlineLegacyReviewCurrent(item) ? '旧复核结果，尚未按新规则复核' : '历史复核与当前内容或核对规则不一致，待重新核对') : {consistent:'两份答案一致，仍需自行核对',different:'与平台答案不一致',uncertain:'存在未决问题',generated:'AI 独立解答，尚无平台对照'}[status];
         const names = {ambiguous:'题意不明确',multiple_correct:'可能多解',no_valid_option:'可能无有效选项',version_dependent:'与 Java 版本有关',malformed_question:'题面或选项有误',missing_information:'缺少必要信息'};
@@ -3255,7 +3372,9 @@ THE SOFTWARE.
         const versions = [...new Set([...array(review.independentAssessment?.javaVersions),...array(review.comparison?.javaVersions)].filter(value => typeof value === 'string'))];
         const warnings = unique.length ? `<ul class="ai-review-issues">${unique.map(issue => `<li><strong>${escapeHtml(names[issue.category] || '待核对')}</strong>：${escapeHtml(issue.explanation)}</li>`).join('')}</ul>` : '';
         const versionNote = versions.length ? `<p class="meta ai-review-versions">Java 版本说明：${escapeHtml(versions.join('；'))}</p>` : '';
-        return `<div class="ai-review" data-review-status="${escapeHtml(status)}"><p class="meta ai-review-status">AI 复核：${escapeHtml(label)}。</p>${warnings}${versionNote}<details class="ai-review-detail"${status === 'different' || status === 'uncertain' ? ' open' : ''}><summary>查看 AI 独立解答与比较说明</summary><div class="answer-heading">AI 独立解答</div><div class="answer-content plain-answer">${escapeHtml(review.independentAnswer)}</div>${review.independentAssessment?.explanation ? `<p class="meta">独立判断说明：${escapeHtml(review.independentAssessment.explanation)}</p>` : ''}${review.comparison?.reason ? `<p class="meta">比较说明：${escapeHtml(review.comparison.reason)}</p>` : ''}<p class="meta">参考内容均已保留；模型判断不等同于权威结论。</p></details></div>`;
+        const shortLabel = {consistent:'AI 复核一致',different:'答案有分歧',uncertain:'存在待核对问题',generated:'尚无平台对照',legacy:'历史复核待更新'}[status] || '复核待核对';
+        const detailLabel = valid ? 'AI 解答与说明' : '历史 AI 解答与说明';
+        return `<div class="ai-review" data-review-status="${escapeHtml(status)}"><details class="ai-review-detail"><summary><span class="ai-review-summary-text"><span class="ai-review-status">${escapeHtml(shortLabel)}</span>${unique.length ? `<span class="ai-review-count">${unique.length} 项提示</span>` : ''}</span><span class="ai-review-summary-action">${detailLabel}</span></summary><div class="ai-review-body"><p class="meta ai-review-context">${escapeHtml(label)}。</p>${warnings}${versionNote}<section class="ai-review-answer"><div class="answer-heading">${valid ? 'AI 独立解答' : '历史 AI 独立解答'}</div><div class="answer-content plain-answer">${escapeHtml(review.independentAnswer)}</div></section>${review.independentAssessment?.explanation ? `<section class="ai-review-explanation"><div class="answer-heading">独立判断说明</div><p>${escapeHtml(review.independentAssessment.explanation)}</p></section>` : ''}${review.comparison?.reason ? `<section class="ai-review-explanation"><div class="answer-heading">比较说明</div><p>${escapeHtml(review.comparison.reason)}</p></section>` : ''}<p class="meta ai-review-disclaimer">参考内容均已保留；模型判断不等同于权威结论。</p></div></details></div>`;
     }
 
     function offlinePracticeContent(item, displayHtml, index) {
@@ -3367,7 +3486,7 @@ THE SOFTWARE.
                     ? `<div class="code-container"><span class="code-language" aria-hidden="true">JAVA</span><pre class="code-box answer-content" tabindex="0"><code>${escapeHtml(item.SniffedAnswer).replace(/\r/g, '&#13;')}</code></pre><button type="button" class="copy-btn" aria-label="复制第 ${index + 1} 题的程序">一键复制</button></div>`
                     : `<div class="answer-content${item.IsAIAnswer ? ' plain-answer' : ''}">${item.IsAIAnswer ? escapeHtml(item.SniffedAnswer) : sanitizeOfflineHtml(item.SniffedAnswer)}</div>`;
                 const reviewContent = offlineReviewContent(item);
-                answer = `<div class="answer-section"><div class="answer-actions"><span class="answer-caption">答案与参考</span>${practiceToggle}<button type="button" class="answer-toggle" aria-expanded="true" aria-controls="answer-${index}">隐藏答案</button></div><div id="answer-${index}" class="answer-box answer-area${reference ? ' reference-answer' : item.IsAIAnswer ? ' ai-answer' : ''}"><div class="answer-heading">${heading}</div>${content}${reviewContent}</div></div>`;
+                answer = `<div class="answer-section"><div class="answer-actions"><span class="answer-caption">参考答案</span><div class="answer-controls">${practiceToggle}<button type="button" class="answer-toggle" aria-expanded="true" aria-controls="answer-${index}">隐藏答案</button></div></div><div id="answer-${index}" class="answer-box answer-area${reference ? ' reference-answer' : item.IsAIAnswer ? ' ai-answer' : ''}"><div class="answer-main"><div class="answer-heading">${heading}</div>${content}</div>${reviewContent}</div></div>`;
             } else if (!item.ExtractionWarning) {
                 answer = `<div class="answer-status">题目已保留，尚无参考答案。</div><div class="answer-actions">${practiceToggle}</div>`;
             } else answer = `<div class="answer-actions">${practiceToggle}</div>`;
@@ -4211,7 +4330,21 @@ offlineViewerRuntime();</script></body></html>`;
         const PRINT_PREPARE_TIMEOUT_MS = 30000;
         const PRINT_IMAGE_CONCURRENCY = 2;
         const pendingPrintDecodes = new WeakMap();
+        const printReviewDetails = new Map();
+        function expandPrintReviews() {
+            for (const detail of document.querySelectorAll('.topic:not(.hidden) .answer-box:not([hidden]) .ai-review-detail')) {
+                if (!printReviewDetails.has(detail)) printReviewDetails.set(detail,detail.open);
+                detail.open = true;
+            }
+        }
+        function restorePrintReviews() {
+            for (const [detail,open] of printReviewDetails) detail.open = open;
+            printReviewDetails.clear();
+        }
         function loadPrintImages(signal) {
+            // Expand first, so the existing image preparation also sees review content.
+            // Hidden answers and filtered-out questions stay hidden in print.
+            expandPrintReviews();
             setReaderImagesPrinting(true);
             const images = Array.from(document.querySelectorAll('.detail-box img,.answer-content img,.practice-area img'));
             // Native beforeprint cannot await preparation: request images without
@@ -4285,6 +4418,7 @@ offlineViewerRuntime();</script></body></html>`;
                 closeMobileDrawer(false);
                 window.print();
             } catch (_) {
+                restorePrintReviews();
                 setReaderImagesPrinting(false);
                 notice.textContent = timedOut ? '图片准备超时，未打开打印。请检查本地图片后重试。' : '打印未能打开，请稍后重试。';
                 notice.hidden = false;
@@ -4297,9 +4431,9 @@ offlineViewerRuntime();</script></body></html>`;
         printButton.addEventListener('click',preparePrint);
         // Browser-menu printing also requests every original image synchronously.
         window.addEventListener('beforeprint',() => { closeMobileDrawer(false); loadPrintImages(); });
-        window.addEventListener('afterprint',() => setReaderImagesPrinting(false));
+        window.addEventListener('afterprint',() => { restorePrintReviews(); setReaderImagesPrinting(false); });
         const printMedia = window.matchMedia && window.matchMedia('print');
-        const loadForPrintMedia = event => { if (event.matches) { closeMobileDrawer(false); loadPrintImages(); } else if (readerImagesPrinting) setReaderImagesPrinting(false); };
+        const loadForPrintMedia = event => { if (event.matches) { closeMobileDrawer(false); loadPrintImages(); } else { restorePrintReviews(); if (readerImagesPrinting) setReaderImagesPrinting(false); } };
         if (printMedia?.addEventListener) printMedia.addEventListener('change',loadForPrintMedia);
         else if (printMedia?.addListener) printMedia.addListener(loadForPrintMedia);
         const topButton = byId('back-to-top');
@@ -4340,7 +4474,9 @@ offlineViewerRuntime();</script></body></html>`;
         .reader-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;width:100%}.global-answer-button,.global-practice-button{width:100%;min-width:0;min-height:38px;padding:8px 5px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);font-size:11px;font-weight:600;text-align:center;line-height:1.5}.global-answer-button{color:var(--accent);border-color:var(--accent-soft);background:var(--accent-soft)}.global-answer-button:not(:disabled):hover,.global-practice-button:not(:disabled):hover{border-color:var(--accent);color:var(--accent);text-decoration:none}.global-practice-button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
         .practice-toggle{border:1px solid var(--line);border-radius:6px;padding:6px 10px;color:var(--accent);background:var(--surface);font-size:12px;font-weight:600;min-height:34px}.practice-toggle[aria-expanded=true]{background:var(--accent-soft);border-color:var(--accent-soft)}.practice-area{margin-top:14px;padding:16px;border:1px solid var(--line);border-radius:9px;background:var(--surface-soft)}.practice-area[hidden]{display:none!important}.practice-area label{font-size:13px}.practice-options{display:grid;gap:9px;margin:12px 0}.practice-option{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:var(--surface);cursor:pointer;overflow-wrap:anywhere;font-size:14px;line-height:1.8}.practice-option:focus-within{outline:2px solid var(--focus);outline-offset:2px}.practice-option input{flex:none;margin-top:6px;accent-color:var(--accent);width:16px;height:16px}.practice-option img{max-width:100%;height:auto}.practice-option:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
         .practice-input{display:block;width:100%;padding:11px 12px;margin:8px 0 12px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink);font:14px/1.7 inherit;resize:vertical}.practice-code{min-height:240px;height:560px;height:min(560px,60vh);background:var(--code);font:13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:4;white-space:pre;overflow:auto}.practice-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.practice-actions button{padding:8px 12px;min-height:36px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--accent);font-size:12px;font-weight:600}.practice-actions button:hover{border-color:var(--accent)}.practice-note{font-size:12px;color:var(--muted);line-height:1.8}.practice-feedback{font-size:13px;line-height:1.8;margin-top:12px;padding:10px 12px;border-radius:7px;border:1px solid var(--line);background:var(--surface);color:var(--muted);white-space:pre-wrap}.practice-feedback:empty{display:none}.practice-feedback[data-state=match]{border-color:var(--accent);color:var(--accent)}.practice-feedback[data-state=different],.practice-feedback[data-state=neutral]{border-color:var(--warning-line);color:var(--warning);background:var(--warning-bg)}
-        .ai-review-issues{padding:12px 15px;margin:12px 0;border:1px solid var(--warning-line);background:var(--warning-bg);color:var(--warning);border-radius:7px;font-size:13px;line-height:1.8;overflow-wrap:anywhere}.ai-review-issues ul{margin:5px 0;padding-left:20px}.ai-review-detail{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}.ai-review-detail summary{cursor:pointer;color:var(--accent);font-size:12px;font-weight:600;padding:5px 0}.ai-review-detail[open]>summary{margin-bottom:10px}
+        .answer-section>.answer-actions{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}.answer-controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0}.answer-section .answer-caption{font-size:12px;color:var(--ink);font-weight:650}.answer-controls .practice-toggle,.answer-controls .answer-toggle{min-height:36px;padding:7px 10px;border:1px solid var(--line);border-radius:6px;font-size:12px;line-height:1.5;white-space:nowrap}.answer-controls .answer-toggle{color:var(--muted);background:var(--surface)}.answer-controls .answer-toggle:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}.answer-main{padding:13px 15px;background:var(--surface-soft);border:1px solid var(--line);border-radius:8px}.answer-main>.answer-heading{margin:0 0 8px;font-size:11px;line-height:1.6}.answer-main>.answer-content>:first-child{margin-top:0}.answer-main>.answer-content>:last-child{margin-bottom:0}.reference-answer>.answer-main{padding:0;background:transparent;border:0}.reference-answer>.answer-main>.answer-heading{margin-bottom:9px}.ai-review{margin-top:10px}.ai-review-pending{margin:10px 0 0;font-size:11px;line-height:1.7;color:var(--faint)}
+        .ai-review-detail{border:1px solid var(--line);border-radius:8px;overflow-wrap:anywhere}.ai-review-detail>summary{display:flex;align-items:center;gap:10px;min-height:44px;padding:10px 12px;list-style:none;cursor:pointer;color:var(--muted);font-size:12px;line-height:1.6}.ai-review-detail>summary::-webkit-details-marker{display:none}.ai-review-detail>summary::after{content:'+';flex:none;color:var(--faint);font:18px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.ai-review-detail[open]>summary::after{content:'−'}.ai-review-detail>summary:hover{background:var(--surface-soft);border-radius:8px}.ai-review-summary-text{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;min-width:0}.ai-review-summary-text>.ai-review-status{font-weight:600;color:var(--muted)}.ai-review[data-review-status=consistent] .ai-review-summary-text>.ai-review-status{color:var(--accent)}.ai-review:is([data-review-status=different],[data-review-status=uncertain],[data-review-status=legacy]) .ai-review-summary-text>.ai-review-status{color:var(--warning)}.ai-review-count{font-size:10px;color:var(--warning);white-space:nowrap}.ai-review-summary-action{margin-left:auto;flex:none;font-size:11px;color:var(--faint)}.ai-review-body{padding:0 14px 14px;border-top:1px solid var(--line)}.ai-review-context{margin:12px 0;color:var(--muted);font-size:12px;line-height:1.8}.ai-review-answer{padding-top:2px}.ai-review-answer>.answer-heading,.ai-review-explanation>.answer-heading{margin:0 0 5px;color:var(--muted);font-size:11px;font-weight:600;line-height:1.7}.ai-review-explanation{margin-top:15px}.ai-review-explanation>p{margin:0;font-size:13px;line-height:1.8;white-space:pre-wrap}.ai-review-issues{padding:10px 12px 10px 28px;margin:12px 0;border:1px solid var(--warning-line);background:var(--warning-bg);color:var(--warning);border-radius:7px;font-size:12px;line-height:1.8;overflow-wrap:anywhere}.ai-review-issues>li+li{margin-top:5px}.ai-review-versions{margin:10px 0;color:var(--muted);font-size:12px;line-height:1.8}.ai-review-disclaimer{margin:14px 0 0;color:var(--faint);font-size:11px;line-height:1.7}
+        @media(max-width:540px){.answer-controls{gap:6px}.answer-controls .practice-toggle,.answer-controls .answer-toggle{min-height:42px;padding:8px;font-size:11px}.answer-main{padding:11px 12px}.ai-review-detail>summary{padding:10px;gap:7px;font-size:11px}.ai-review-summary-action{font-size:10px;max-width:7em;text-align:right}.ai-review-body{padding:0 12px 12px}.ai-review-explanation>p{font-size:12px}}
         @media(max-width:540px){.results-toolbar{padding:15px}.reader-actions{grid-template-columns:1fr 1fr}.global-answer-button,.global-practice-button{font-size:12px;min-height:44px;padding:9px 6px}.practice-area{padding:12px}.practice-input{font-size:16px}.practice-code{font-size:16px;height:min(560px,55vh)}.practice-option{padding:11px;font-size:14px}.practice-toggle{min-height:40px}.practice-feedback{font-size:12px}.answer-actions{flex-wrap:wrap}}
         @media print{.practice-area,.practice-toggle,.practice-feedback,.global-practice-button{display:none!important}}
         .practice-code{display:block;width:100%;max-width:100%;padding:15px;margin:8px 0 12px;border:1px solid var(--line);border-radius:7px;color:var(--ink);resize:vertical}.detail-box .practice-option{display:flex;align-items:flex-start;gap:10px}.topic:not(.practice-active) .practice-option{cursor:default}.practice-label{display:block;margin:9px 0 5px}.practice-draft-note{font-size:11px;color:var(--faint);margin-top:8px}
@@ -4371,6 +4507,25 @@ offlineViewerRuntime();</script></body></html>`;
                 }
                 else if (globalState.stage === 4) await runStage4();
                 else throw new Error('断点阶段无效。');
+            }
+            // Finish image collection before presenting a recoverable AI failure.
+            // A rejected model response must not strand all of the original images.
+            for (const item of allData) {
+                // Stage 4 has now independently confirmed the exact failed image
+                // is missing at the source. Keep the missing-image/AI warning,
+                // without turning a permanent 404 into endless resumptions.
+                if (item.AIError?.category === 'image' && imageQueue.get(item.AIError.imageUrl)?.sourceUnavailable) clearAiFailure(item);
+            }
+            const failedAi = keyManager.keys.length ? allData.filter(item => item.AIError && needsAiWork(item)) : [];
+            const serviceError = keyManager.keys.length && globalState.aiServiceError;
+            if (!globalState.isPaused && globalState.stage > 4 && (failedAi.length || serviceError)) {
+                globalState.stage = 3;
+                globalState.isPaused = true;
+                globalState.lastError = serviceError ? `题目与图片已处理；AI 等待处理：${serviceError.message} 已保留成功结果，修改设置或 Key 后可恢复，也可清空 Key 跳过剩余 AI 工作。` :
+                    `题目与图片已处理；${failedAi.length} 道题的 AI 步骤多次失败，已保留成功结果和重试记录。恢复后只处理未完成步骤。`;
+                addLog(globalState.lastError, 'warning');
+                const remaining = serviceError ? allData.filter(item => needsAiWork(item)).length : failedAi.length;
+                updateUI(3, `${remaining} 题待处理，已完成的结果已保存`);
             }
         } catch (error) {
             globalState.isPaused = true; globalState.lastError = error.message;

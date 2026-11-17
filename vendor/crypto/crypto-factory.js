@@ -99,7 +99,7 @@ var BistuNoble=(()=>{var $=Object.defineProperty;var Nt=Object.getOwnPropertyDes
         } finally { secret.fill(0); }
     }
     async function createSession(password) {
-        if (typeof password !== 'string' || password.length < 12 || password.length > 256) throw new Error('导出密码须为 12–256 个字符。');
+        if (typeof password !== 'string' || password.length < 4 || password.length > 256) throw new Error('导出密码须为 4–256 个字符。');
         const config = {version:1,kdf:'PBKDF2-SHA256',iterations:ITERATIONS,salt:base64(random(16)),cipher:'AES-256-GCM'};
         return {key:await deriveKey(password,config),config};
     }
