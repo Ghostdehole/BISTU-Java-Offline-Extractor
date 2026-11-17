@@ -233,3 +233,32 @@ test('recovery: AI service rejection stops new requests but saves images before 
     assert.deepEqual(result.packages,[{isFinal:false,imageSaved:true},{isFinal:true,imageSaved:true}]);assert.deepEqual(result.leases,[0]);
   });
 });
+
+test('recovery: manual pause before image confirmation preserves an earlier image-related AI failure',()=>withPage(async page=>{
+  const expected=await page.evaluate(()=>{
+    const imageUrl='http://fixture.test/previously-missing.png';
+    const warning='Synthetic earlier image failure requires a fresh source check';
+    const failure={version:1,phase:'material',category:'image',imageUrl,message:'Synthetic previous 404',attempts:1,maxAttempts:1,retryable:true,updatedAt:'2026-01-01T00:00:00.000Z',warning};
+    __test.setData([{GlobalUID:0,TopicGuid:'synthetic-paused-image',QuestionType:'Blank',Title:'Synthetic interrupted image check',
+      DetailHtml:'<p>Synthetic interrupted image check</p><img src="images/img_1.png">',BlankCount:1,PlatformDetailChecked:true,
+      s2_done:true,s3_done:false,NeedsAI:true,SniffedAnswer:'',imgUrls:[imageUrl],AIError:{...failure},ExtractionWarning:warning}]);
+    __test.setImages([[imageUrl,{filename:'img_1.png',downloaded:false,buffer:null,sourceUnavailable:true,status:404}]]);
+    __test.keyManager.updateKeys('synthetic-paused-image-key');__test.state.stage=3;
+    window.__imageStageCalls=0;window.__pausedPackages=[];window.__recoveryStageEntered=false;
+    __test.setEngineStage(3,async()=>{__recoveryStageEntered=true;await new Promise(resolve=>{window.__releaseRecoveryStage=resolve;});});
+    __test.setEngineStage(4,async()=>{__imageStageCalls++;__test.state.stage=5;});
+    __test.setBuilder(async isFinal=>__pausedPackages.push({isFinal,error:__test.data[0].AIError,warning:__test.data[0].ExtractionWarning}));
+    window.__pausedEngine=__test.runEngine();
+    return{failure,warning};
+  });
+  await page.waitForFunction(()=>window.__recoveryStageEntered);
+  await page.locator('#bistu-pause-btn').click();
+  const result=await page.evaluate(async()=>{
+    __releaseRecoveryStage();await __pausedEngine;
+    return{paused:__test.state.isPaused,stage:__test.state.stage,imageStageCalls:__imageStageCalls,packages:__pausedPackages,
+      error:__test.data[0].AIError,warning:__test.data[0].ExtractionWarning,done:__test.data[0].s3_done};
+  });
+  assert.equal(result.paused,true);assert.equal(result.stage,3);assert.equal(result.imageStageCalls,0);assert.equal(result.done,false);
+  assert.deepEqual(result.error,expected.failure);assert.equal(result.warning,expected.warning);
+  assert.deepEqual(result.packages,[{isFinal:false,error:expected.failure,warning:expected.warning}]);
+}));

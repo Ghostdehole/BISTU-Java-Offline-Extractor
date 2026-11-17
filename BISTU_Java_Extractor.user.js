@@ -4510,7 +4510,7 @@ offlineViewerRuntime();</script></body></html>`;
             }
             // Finish image collection before presenting a recoverable AI failure.
             // A rejected model response must not strand all of the original images.
-            for (const item of allData) {
+            for (const item of !globalState.isPaused && globalState.stage > 4 ? allData : []) {
                 // Stage 4 has now independently confirmed the exact failed image
                 // is missing at the source. Keep the missing-image/AI warning,
                 // without turning a permanent 404 into endless resumptions.
